@@ -67,13 +67,31 @@ def build_sft_example(messages: list[dict], tokenizer) -> tuple[list[int], list[
     return input_ids, loss_mask
 
 
+def xlam_to_messages(row: dict) -> list[dict]:
+    """Adapt an xLAM-shaped row ({query, tools, answers}, all JSON strings
+    except query) into the {role, content} shape build_sft_example expects
+    (plan 00 §9): system turn lists the available tools, user turn is the
+    query, assistant turn is the tool call, marked with <|tool_call|>."""
+    return [
+        {"role": "system", "content": f"Available tools:\n{row['tools']}"},
+        {"role": "user", "content": row["query"]},
+        {"role": "assistant", "content": f"<|tool_call|>{row['answers']}"},
+    ]
+
+
 def stream_sft_examples(
-    repo_id: str, config_name: str, tokenizer, max_examples: int | None = None
+    repo_id: str,
+    tokenizer,
+    config_name: str | None = None,
+    max_examples: int | None = None,
+    row_to_messages=lambda row: row["messages"],
 ) -> Iterator[tuple[list[int], list[bool]]]:
-    """Stream a SmolTalk-shaped ({messages: [{role, content}]}) HF dataset
-    and format each conversation via build_sft_example (plan 00 §7)."""
+    """Stream a chat-shaped HF dataset and format each conversation via
+    build_sft_example (plan 00 §7). Defaults to the {messages: [...]} shape
+    (SmolTalk, Dolci-Think-SFT); pass `row_to_messages` (e.g.
+    xlam_to_messages) to adapt a differently-shaped dataset first."""
     ds = load_dataset(repo_id, config_name, split="train", streaming=True)
     for i, row in enumerate(ds):
         if max_examples is not None and i >= max_examples:
             break
-        yield build_sft_example(row["messages"], tokenizer)
+        yield build_sft_example(row_to_messages(row), tokenizer)

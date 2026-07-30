@@ -51,6 +51,35 @@ def test_train_step_updates_expert_bias():
         assert not torch.equal(before, after)
 
 
+def test_train_step_with_mtp_target_trains_the_mtp_head():
+    """plan 09: when the model has an mtp_head and mtp_target_ids (the
+    ground-truth t+2 tokens) is passed, train_step must also backprop into
+    the MTP head -- not silently ignore it."""
+    torch.manual_seed(0)
+    model = MalvinasModel(
+        vocab_size=16,
+        d_model=16,
+        n_layers=2,
+        n_heads=2,
+        num_experts=4,
+        top_k=2,
+        expert_dim=32,
+        max_seq_len=8,
+        rope_theta=10000.0,
+        mtp_depth=1,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+    input_ids = torch.randint(0, 16, (2, 6))
+    target_ids = torch.randint(0, 16, (2, 6))  # t+1
+    mtp_target_ids = torch.randint(0, 16, (2, 6))  # t+2
+
+    train_step(model, optimizer, input_ids, target_ids, mtp_target_ids=mtp_target_ids)
+
+    assert model.mtp_head.combine_proj.weight.grad is not None
+    assert model.mtp_head.combine_proj.weight.grad.abs().sum() > 0
+
+
 def test_compute_loss_without_mask_matches_plain_cross_entropy():
     torch.manual_seed(0)
     logits = torch.randn(2, 4, 16)

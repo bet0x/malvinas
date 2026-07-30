@@ -29,12 +29,20 @@ def train_step(
     input_ids: torch.Tensor,
     target_ids: torch.Tensor,
     loss_mask: torch.Tensor | None = None,
+    mtp_target_ids: torch.Tensor | None = None,
+    mtp_weight: float = 0.1,
 ) -> float:
-    """One training step: forward, loss (optionally SFT-masked), backward,
-    optimizer step, then nudge each MoE layer's expert bias (plan 03, no
-    gradient)."""
-    logits = model(input_ids)
-    loss = compute_loss(logits, target_ids, loss_mask)
+    """One training step: forward, loss (optionally SFT-masked and/or with
+    an MTP auxiliary term, plan 09), backward, optimizer step, then nudge
+    each MoE layer's expert bias (plan 03, no gradient)."""
+    if mtp_target_ids is not None:
+        logits, mtp_logits = model.forward_with_mtp(input_ids, target_ids)
+        loss = compute_loss(logits, target_ids, loss_mask) + mtp_weight * compute_loss(
+            mtp_logits, mtp_target_ids, loss_mask
+        )
+    else:
+        logits = model(input_ids)
+        loss = compute_loss(logits, target_ids, loss_mask)
 
     optimizer.zero_grad()
     loss.backward()

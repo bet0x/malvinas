@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from malvinas.block import TransformerBlock
+from malvinas.mtp import MTPHead
 from malvinas.norm import RMSNorm
 from malvinas.rope import precompute_freqs_cis
 
@@ -22,6 +23,7 @@ class MalvinasModel(nn.Module):
         local_window_size: int | None = None,
         global_rope_theta: float | None = None,
         global_rotary_pct: float = 1.0,
+        mtp_depth: int | None = None,
     ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -58,6 +60,14 @@ class MalvinasModel(nn.Module):
         )
         self.register_buffer("freqs_cis_global", freqs_cis_global, persistent=False)
 
+        self.mtp_head = None
+        if mtp_depth is not None:
+            assert mtp_depth == 1, "only mtp_depth=1 is implemented"
+            self.mtp_head = MTPHead(
+                d_model, n_heads, num_experts, top_k, expert_dim,
+                self.token_embedding, self.output_head,
+            )
+
     def resize_token_embeddings(self, new_vocab_size: int) -> None:
         """Grow the vocab (e.g. adding tool-call special tokens, plan 00
         §9), keeping every existing row's weights and the tied output head."""
@@ -72,11 +82,32 @@ class MalvinasModel(nn.Module):
         self.output_head = nn.Linear(d_model, new_vocab_size, bias=False)
         self.output_head.weight = self.token_embedding.weight  # re-tie
 
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        if self.mtp_head is not None:
+            self.mtp_head.token_embedding = self.token_embedding
+            self.mtp_head.output_head = self.output_head
+
+    def _trunk_forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Runs every transformer block, returns the hidden state *before*
+        final_norm/output_head -- shared by forward() and forward_with_mtp()."""
         T = token_ids.shape[1]
         x = self.token_embedding(token_ids)
         for block, is_global in zip(self.blocks, self.is_global_layer):
             freqs_cis = self.freqs_cis_global if is_global else self.freqs_cis_local
             x = block(x, freqs_cis[:T])
-        x = self.final_norm(x)
-        return self.output_head(x)
+        return x
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        x = self._trunk_forward(token_ids)
+        return self.output_head(self.final_norm(x))
+
+    def forward_with_mtp(
+        self, token_ids: torch.Tensor, next_token_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Plan 09: main next-token logits, plus the MTP head's t+2
+        prediction from the same trunk hidden state + the known t+1 tokens."""
+        assert self.mtp_head is not None, "model was built without mtp_depth"
+        T = token_ids.shape[1]
+        hidden = self._trunk_forward(token_ids)
+        logits = self.output_head(self.final_norm(hidden))
+        mtp_logits = self.mtp_head(hidden, next_token_ids, self.freqs_cis_local[:T])
+        return logits, mtp_logits
