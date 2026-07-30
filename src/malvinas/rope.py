@@ -1,6 +1,14 @@
 import torch
 
 
+def freqs_cis_from_inv_freq(inv_freq: torch.Tensor, max_seq_len: int) -> torch.Tensor:
+    """Complex-exponential RoPE frequencies from an explicit inv_freq tensor
+    (e.g. YaRN-rescaled), one row per position: (max_seq_len, len(inv_freq))."""
+    positions = torch.arange(max_seq_len, dtype=torch.float)
+    freqs = torch.outer(positions, inv_freq)
+    return torch.polar(torch.ones_like(freqs), freqs)
+
+
 def precompute_freqs_cis(
     dim: int, max_seq_len: int, theta: float, rotary_pct: float = 1.0
 ) -> torch.Tensor:
@@ -11,9 +19,7 @@ def precompute_freqs_cis(
     rotary_dim = int(dim * rotary_pct)
     freq_indices = torch.arange(0, rotary_dim, 2, dtype=torch.float)
     inv_freq = 1.0 / (theta ** (freq_indices / rotary_dim))
-    positions = torch.arange(max_seq_len, dtype=torch.float)
-    freqs = torch.outer(positions, inv_freq)
-    return torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis_from_inv_freq(inv_freq, max_seq_len)
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:

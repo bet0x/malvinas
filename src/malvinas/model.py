@@ -58,6 +58,20 @@ class MalvinasModel(nn.Module):
         )
         self.register_buffer("freqs_cis_global", freqs_cis_global, persistent=False)
 
+    def resize_token_embeddings(self, new_vocab_size: int) -> None:
+        """Grow the vocab (e.g. adding tool-call special tokens, plan 00
+        §9), keeping every existing row's weights and the tied output head."""
+        old_embedding = self.token_embedding
+        old_vocab_size, d_model = old_embedding.weight.shape
+
+        new_embedding = nn.Embedding(new_vocab_size, d_model)
+        with torch.no_grad():
+            new_embedding.weight[:old_vocab_size] = old_embedding.weight
+
+        self.token_embedding = new_embedding
+        self.output_head = nn.Linear(d_model, new_vocab_size, bias=False)
+        self.output_head.weight = self.token_embedding.weight  # re-tie
+
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         T = token_ids.shape[1]
         x = self.token_embedding(token_ids)
