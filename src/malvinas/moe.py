@@ -37,13 +37,20 @@ class MoEFeedForward(nn.Module):
 
         self.shared_expert = SwiGLU(d_model, expert_dim)
 
+        self.register_buffer("expert_bias", torch.zeros(num_experts))
+        self.last_selected_experts = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
         x_flat = x.reshape(-1, C)
 
         router_logits = self.router(x_flat)
-        routing_weights, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
-        routing_weights = torch.sigmoid(routing_weights)
+        # expert_bias only steers *selection*; the gate value uses the
+        # unbiased affinity (DeepSeek-V3 auxiliary-loss-free balancing).
+        biased_logits = router_logits + self.expert_bias
+        _, selected_experts = torch.topk(biased_logits, self.top_k, dim=-1)
+        self.last_selected_experts = selected_experts.reshape(-1).detach()
+        routing_weights = torch.sigmoid(torch.gather(router_logits, -1, selected_experts))
 
         token_idx = torch.arange(B * T, device=x.device).repeat_interleave(self.top_k)
         expert_idx = selected_experts.reshape(-1)
@@ -64,3 +71,12 @@ class MoEFeedForward(nn.Module):
 
         out = combined.view(B, T, C) + self.shared_expert(x)
         return out
+
+    @torch.no_grad()
+    def update_expert_bias(self, update_rate: float) -> None:
+        """DeepSeek-V3-style auxiliary-loss-free balancing: nudge each
+        expert's bias down if it took more than its uniform share of the
+        last forward's selections, up if it took less. No gradient."""
+        counts = torch.bincount(self.last_selected_experts, minlength=self.num_experts).float()
+        target = counts.sum() / self.num_experts
+        self.expert_bias -= update_rate * torch.sign(counts - target)
