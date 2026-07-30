@@ -15,23 +15,27 @@ speculative-decoding draft model at inference — Gemma 4's variant separates
 this into a standalone small drafter that only needs the main model's KV
 cache, not a full parallel trunk.
 
-## How it plugs into the current script
+## How it plugs into the architecture
 
-- Add `mtp_depth = 1` (predict `t+1` in addition to the base `t+1`... i.e.
-  `t+2` beyond the normal target) and one small extra head reusing the same
-  `d_model` width: an `nn.Linear(d_model, vocab_size, bias=False)` plus (DeepSeek
-  style) a tiny transformer block, or (Gemma-4 style) just a cross-attention
-  layer over the final `x` from `forward()`.
-- Needs a second target tensor shifted by 2 instead of 1
-  (`train_y2 = full_data_sequence[i+2 : i+block_size+2]`, built alongside the
-  existing `train_x`/`train_y` construction).
-- In the training loop: `loss = criterion(...) + mtp_weight *
-  criterion(mtp_logits.view(...), yb2.view(...))`.
+- One extra head predicting `t+2` (DeepSeek-style: its own small transformer
+  block, taking the main trunk's hidden state plus the embedding of the
+  already-known `t+1` token; Gemma-4-style would instead be a standalone
+  cross-attention drafter over the main model's KV cache).
+- A second target tensor, shifted by 2 instead of 1.
+- A second loss term: `loss = main_loss + mtp_weight * mtp_loss`.
 
 ## Why this order
 
-Requires touching data prep (second shifted target), the forward pass (a new
-head), and the training loop (a second loss term) simultaneously — three
-places instead of one, which is why it lands above the single-loss-term
-plans (02/03) and the pure-attention tweaks (06/07/08) despite not being
-conceptually exotic.
+Requires touching data prep (second shifted target), the forward pass (a
+new head), and the training loop (a second loss term) simultaneously —
+three places instead of one, despite not being conceptually exotic.
+
+## Status: implemented (DeepSeek-style)
+
+`src/malvinas/mtp.py`, `MTPHead` — combine projection + norm + one more
+`TransformerBlock`, predicting `t+2` from the trunk's hidden state and the
+ground-truth `t+1` embedding. Wired into `MalvinasModel.forward_with_mtp`
+and `train.py`'s `train_step(mtp_target_ids=...)`, which adds the weighted
+MTP loss on top of the main next-token loss. Also covers an interaction
+that would otherwise be a silent bug: `resize_token_embeddings` re-ties
+`mtp_head`'s embedding/output-head references to the new (grown) ones.

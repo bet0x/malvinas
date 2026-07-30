@@ -5,11 +5,10 @@
 
 ## Problem
 
-`train_moe.py` routes each token to `num_experts_per_tok` of `num_local_experts`
-via `torch.topk(router_logits, ...)`, but the only loss is `criterion`
-(cross-entropy). Nothing discourages the router from always picking the same 1-2
-experts. With 4 experts and no pressure to balance, collapse is a real risk —
-the "4 experts, top-2" setup degenerates into an expensive top-1 or top-2-fixed.
+A top-k MoE router with no balancing pressure has a real collapse risk —
+with only cross-entropy loss, nothing discourages the router from always
+picking the same 1-2 experts, and a "many experts, top-k" setup degenerates
+into an expensive top-k-fixed.
 
 ## What it does
 
@@ -27,23 +26,29 @@ loss = criterion(...) + aux_loss_coeff * aux_loss
 is typically small (0.01–0.1) so it nudges balance without dominating the main
 objective.
 
-## How it plugs into the current script
+## How it plugs into the architecture
 
-Inside the `forward()` MoE block (around `router_logits = moe_routers[i](x_norm)`):
+Inside `MoEFeedForward.forward()` (`src/malvinas/moe.py`), around where
+`router_logits`/`selected_experts` are computed:
 
-- Compute `router_probs = F.softmax(router_logits, dim=-1)` (currently only
-  `torch.topk` + `sigmoid` on the top-k logits is computed — softmax over *all*
-  experts is a separate, additional quantity needed just for the aux loss).
-- Compute `f_i` from `selected_experts` via a one-hot count per expert, averaged
-  over `B*T*num_experts_per_tok`.
-- Accumulate `aux_loss` per layer, sum across `n_layers`, return it alongside
-  `logits` from `forward()` (currently returns only `logits` — needs a second
-  return value).
-- In the training loop, add `aux_loss_coeff * aux_loss` to `loss` before
-  `.backward()`.
+- Compute `router_probs = F.softmax(router_logits, dim=-1)` (a separate
+  quantity from the top-k selection itself, needed only for this loss).
+- Compute `f_i` from `selected_experts` via a one-hot count per expert,
+  averaged over all routed tokens.
+- Return `aux_loss` alongside the module's output (needs a second return
+  value or an instance attribute the training loop reads after the call —
+  same pattern already used for `expert_bias`/`last_selected_experts`).
+- In the training loop, add `aux_loss_coeff * aux_loss` to the main loss
+  before `.backward()`.
 
 ## Why this order
 
 Cheapest possible win: no architecture change, no new parameters, just an
-extra loss term computed from tensors `forward()` already has in scope.
-Directly addresses the biggest real gap identified in this trainer.
+extra loss term computed from tensors already in scope.
+
+## Status: not implemented — plan 03 was chosen instead
+
+Plan 03's auxiliary-loss-free dynamic bias (`MoEFeedForward.expert_bias` +
+`update_expert_bias`, no gradient, no extra loss term) is what's actually
+wired in and tested. This plan stays documented as the fallback if 03 ever
+proves harder to tune well in practice — see `docs/architecture.md`.

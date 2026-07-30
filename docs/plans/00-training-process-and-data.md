@@ -47,18 +47,10 @@ production MoEs like DeepSeekMoE/OLMoE. Widening (`d_model`) vs deepening
 steps, width = more per-token capacity) — no strong reason to prefer one for
 this project; start with the 0.5B row, it's the cheaper one to iterate on.
 
-## 3. Tokenizer: not GPT-2's vocab, but not for the reason you'd expect
+## 3. Tokenizer: not GPT-2's vocab
 
-Speed isn't actually the argument against GPT-2 once
-[Gigatoken](https://github.com/marcelroed/gigatoken) is in the pipeline (see
-plan 01) — in Gigatoken's own benchmark table, **GPT-2's tokenizer is the
-fastest entry**, 24.53 GB/s, faster than Llama4/DeepSeek-V3/Qwen3 in the same
-table. The "GPT-2 is slow" reputation comes from the stock HF/Python
-implementation, not the tokenizer algorithm itself.
-
-The real reason to skip literal GPT-2 (OpenAI's 2019 vocab, trained mostly on
-old web text) is **compression quality and vocab-size-vs-parameter-budget**,
-not speed:
+The reason to skip literal GPT-2 (OpenAI's 2019 vocab, trained mostly on old
+web text) is **compression quality and vocab-size-vs-parameter-budget**:
 
 - A bigger, more modern vocab (Llama 3: 128k, Qwen2.5: ~152k, GPT-4o's
   `o200k_base`: 200k) compresses English/code/multilingual text into fewer
@@ -68,16 +60,15 @@ not speed:
   — at `d_model=512` a 152k vocab alone is 78M params, ~17% of the whole 0.5B
   budget for a component that does zero reasoning).
 
-**Recommendation: reuse the SmolLM2 tokenizer** (`HuggingFaceTB/SmolLM2-135M`,
-via `AutoTokenizer.from_pretrained`) — 49,152 vocab, GPT-2-style BPE but
-retrained on a modern mix (70% FineWeb-Edu, 15% Cosmopedia-v2, 8%
-OpenWebMath, 5% StarCoderData, 2% StackOverflow). It's sized specifically for
-small models, trained on broadly the same *kind* of data (quality-filtered
-web + math + code) we're about to pretrain on (section 5) even though the
-exact corpus differs (Dolma 3 there, not FineWeb-Edu) — close enough in
-composition that compression stays reasonable, and drops straight into
-Gigatoken's HF-compatibility mode for fast encoding. Best of both complaints
-solved at once: modern + appropriately small for a sub-1B model.
+**Recommendation: reuse the SmolLM2 tokenizer** (`HuggingFaceTB/SmolLM2-135M`)
+— 49,152 vocab, GPT-2-style BPE but retrained on a modern mix (70%
+FineWeb-Edu, 15% Cosmopedia-v2, 8% OpenWebMath, 5% StarCoderData, 2%
+StackOverflow). It's sized specifically for small models, trained on
+broadly the same *kind* of data (quality-filtered web + math + code) we're
+about to pretrain on (section 5) even though the exact corpus differs
+(Dolma 3 there, not FineWeb-Edu) — close enough in composition that
+compression stays reasonable. Implemented in `src/malvinas/tokenizer.py`
+(plan 01).
 
 ## 4. How much data: scaling laws, applied to *active* parameters
 
@@ -154,8 +145,9 @@ this is a deliberate blend of two labs' data, not one coherent released recipe.
 
 ## 6. Context length: 4096, and why that forces plan 08's hand
 
-`block_size=64` in the current script becomes `block_size=4096`. Two direct
-consequences:
+The target context length is `block_size=4096` (before the section 8 YaRN
+extension to 128K), not the tiny context of early toy experiments. Two
+direct consequences:
 
 - **Attention cost**: full causal attention is O(block_size²) per layer.
   At 4096 that's real (16.7M score entries per head per layer, times
@@ -239,10 +231,10 @@ mixture** and a **consistent conversation format**.
   marks a tool invocation in the model's output; `<|eom_id|>` ends a message
   when the model expects to call a tool next (vs. `<|eot_id|>` for a normal
   turn end). Equivalent to adding 2-3 new special tokens to the SmolLM2
-  tokenizer (`tokenizer.add_special_tokens(...)`) and resizing
-  `token_embedding_table`/`output_linear_layer` by that many rows
+  tokenizer and resizing the tied embedding/output head by that many rows
   (copy existing weights, randomly init the new rows) — a small, mechanical
-  change, not a new tokenizer.
+  change, not a new tokenizer. Implemented: `Tokenizer.add_special_tokens`
+  and `MalvinasModel.resize_token_embeddings`.
 - **The actual content is training data**: conversations where the system
   turn lists available tools (JSON-schema-style function signatures), the
   model emits a structured tool call instead of a direct answer, a tool
@@ -343,9 +335,9 @@ SFT (SmolTalk + tools + reasoning) → DPO (Dolci-Instruct-DPO)**.
 1. **Pretrain** the 0.5B config (section 2) on the Dolma 3 Mix 150B dataset
    (section 5), tokenized with the SmolLM2 tokenizer (section 3),
    at `block_size=4096` with plan 08's local/global attention (section 6).
-   This is a next-token-prediction run, same shape as the current script's
-   training loop, just at real scale — a serious single-GPU job (one
-   B200-class card, per section 1), not a laptop run.
+   This is a next-token-prediction run using `train.py`'s `train_step`, just
+   at real scale — a serious single-GPU job (one B200-class card, per
+   section 1), not a laptop run.
 2. **Extend context to 128K via YaRN** (section 8) — a short dedicated
    fine-tuning pass on long-form documents, rescaling RoPE rather than
    training long-context from scratch.
