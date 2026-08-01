@@ -21,6 +21,8 @@ class MoEFeedForward(nn.Module):
 
     def __init__(self, d_model: int, num_experts: int, top_k: int, expert_dim: int):
         super().__init__()
+        if not 1 <= top_k <= num_experts:
+            raise ValueError("top_k must be between 1 and num_experts")
         self.d_model = d_model
         self.num_experts = num_experts
         self.top_k = top_k
@@ -56,18 +58,19 @@ class MoEFeedForward(nn.Module):
         expert_idx = selected_experts.reshape(-1)
         routing_weights_flat = routing_weights.reshape(-1)
 
-        expert_inputs = x_flat[token_idx]
-        gate_up_w = self.expert_gate_up_proj[expert_idx]
-        down_w = self.expert_down_proj[expert_idx]
-
-        gate_up = torch.bmm(expert_inputs.unsqueeze(1), gate_up_w)
-        gate, up = gate_up.chunk(2, dim=-1)
-        activated = self.act(gate) * up
-        expert_out = torch.bmm(activated, down_w).squeeze(1)
-        expert_out = expert_out * routing_weights_flat.unsqueeze(-1)
-
         combined = torch.zeros_like(x_flat)
-        combined.scatter_add_(0, token_idx.unsqueeze(-1).expand(-1, C), expert_out)
+        for expert_id in range(self.num_experts):
+            assignment_mask = expert_idx == expert_id
+            expert_token_idx = token_idx[assignment_mask]
+            if expert_token_idx.numel() == 0:
+                continue
+
+            expert_inputs = x_flat[expert_token_idx]
+            gate_up = expert_inputs @ self.expert_gate_up_proj[expert_id]
+            gate, up = gate_up.chunk(2, dim=-1)
+            expert_out = (self.act(gate) * up) @ self.expert_down_proj[expert_id]
+            expert_out = expert_out * routing_weights_flat[assignment_mask].unsqueeze(-1)
+            combined.index_add_(0, expert_token_idx, expert_out.to(combined.dtype))
 
         out = combined.view(B, T, C) + self.shared_expert(x)
         return out

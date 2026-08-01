@@ -54,3 +54,14 @@ def test_resize_token_embeddings_preserves_existing_rows_and_stays_tied():
     token_ids = torch.tensor([[old_vocab_size, old_vocab_size + 1]])  # newly added ids
     logits = model(token_ids)
     assert logits.shape == (1, 2, old_vocab_size + 4)
+
+
+def test_resize_token_embeddings_preserves_dtype():
+    model = make_model()
+    model.token_embedding.to(dtype=torch.float64)
+    model.output_head.weight = model.token_embedding.weight
+
+    model.resize_token_embeddings(20)
+
+    assert model.token_embedding.weight.dtype == torch.float64
+    assert model.output_head.weight.dtype == torch.float64

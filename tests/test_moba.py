@@ -63,3 +63,19 @@ def test_own_block_is_always_attended_even_with_low_relevance_score():
     # position 3 (query) shares chunk 1 with position 2 -- if chunk 1 were
     # ever dropped in favor of only chunk 0, this would stay unchanged
     assert not torch.allclose(out_a[0, 3], out_b[0, 3], atol=1e-6)
+
+
+def test_block_routing_returns_compact_block_ids_instead_of_token_mask():
+    torch.manual_seed(0)
+    moba = make_moba(d_model=16, n_heads=2, chunk_size=2, top_k=2)
+    q = torch.randn(2, 8, 8)
+    k = torch.randn(2, 8, 8)
+    chunk_keys = torch.stack(
+        [k[:, start : start + 2].mean(dim=1) for start in range(0, 8, 2)], dim=1
+    )
+
+    selected = moba._select_blocks(q, chunk_keys, torch.arange(8))
+
+    assert selected.shape == (2, 8, 2)
+    current_blocks = torch.arange(8) // 2
+    assert torch.all((selected == current_blocks.view(1, 8, 1)).any(dim=-1))

@@ -7,22 +7,62 @@ from datasets import load_dataset
 
 def pack_tokens(
     documents: Iterable[list[int]], block_size: int, separator_id: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Concatenate tokenized documents with a separator between each, then
-    slice into fixed-length (input, target) blocks -- standard pretraining
-    packing (plan 00 §6). Any final stretch too short for a full
-    block+target is dropped."""
-    stream: list[int] = []
-    for doc in documents:
-        stream.extend(doc)
-        stream.append(separator_id)
+    yield fixed-length (input, target) blocks incrementally. Memory remains
+    bounded by the current document plus one incomplete block; any final
+    stretch too short for a full block+target is dropped."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
 
-    num_blocks = max(0, (len(stream) - 1) // block_size)
-    x = torch.tensor([stream[i * block_size : i * block_size + block_size] for i in range(num_blocks)])
-    y = torch.tensor(
-        [stream[i * block_size + 1 : i * block_size + block_size + 1] for i in range(num_blocks)]
-    )
-    return x, y
+    buffer: list[int] = []
+    for doc in documents:
+        buffer.extend(doc)
+        buffer.append(separator_id)
+        consumed = 0
+        while len(buffer) - consumed >= block_size + 1:
+            block = torch.tensor(
+                buffer[consumed : consumed + block_size + 1], dtype=torch.long
+            )
+            yield block[:-1], block[1:]
+            consumed += block_size
+        if consumed:
+            del buffer[:consumed]
+
+
+def pack_sft_tokens(
+    examples: Iterable[tuple[list[int], list[bool]]],
+    block_size: int,
+    separator_id: int,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Pack tokenized conversations and align the assistant-only mask with
+    next-token targets. Separators never contribute to the SFT loss."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+
+    token_buffer: list[int] = []
+    mask_buffer: list[bool] = []
+    for input_ids, loss_mask in examples:
+        if len(input_ids) != len(loss_mask):
+            raise ValueError("input_ids and loss_mask must have the same length")
+        token_buffer.extend(input_ids)
+        token_buffer.append(separator_id)
+        mask_buffer.extend(loss_mask)
+        mask_buffer.append(False)
+
+        consumed = 0
+        while len(token_buffer) - consumed >= block_size + 1:
+            tokens = torch.tensor(
+                token_buffer[consumed : consumed + block_size + 1], dtype=torch.long
+            )
+            target_mask = torch.tensor(
+                mask_buffer[consumed + 1 : consumed + block_size + 1], dtype=torch.bool
+            )
+            yield tokens[:-1], tokens[1:], target_mask
+            consumed += block_size
+        if consumed:
+            del token_buffer[:consumed]
+            del mask_buffer[:consumed]
 
 
 def dolma_quality_score(metadata_json: str) -> float:

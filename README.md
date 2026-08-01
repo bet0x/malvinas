@@ -13,8 +13,8 @@ diagrams the target shape. Start at [`docs/plans/README.md`](docs/plans/README.m
 
 ## Status
 
-All 12 architecture plans are implemented, test-first, in `src/malvinas/`
-(59 tests, `uv run pytest`). What's here:
+All 12 architecture plans are implemented, test-first, in `src/malvinas/`.
+The project also includes a runnable, resumable training CLI. What's here:
 
 | Module | What it is |
 |---|---|
@@ -32,19 +32,57 @@ All 12 architecture plans are implemented, test-first, in `src/malvinas/`
 | `tokenizer.py` | Wraps the real SmolLM2 tokenizer (plan 01) |
 | `data.py` | Streaming + packing for pretraining (Dolma 3 Mix) and SFT (SmolTalk, xLAM, Dolci-Think) |
 | `train.py` | `train_step`/`compute_loss` — pretrain, SFT (loss masking), and MTP in one training loop |
+| `config.py` | Selectable `tiny`, `0.5b`, `1b-deep`, and `1b-wide` model presets |
+| `checkpoint.py` | Atomic checkpoints with model, optimizer, progress, and RNG state |
+| `cli.py` | `malvinas-train` CLI for pretraining, SFT, resume, and stage initialization |
 
 `mla.py`/`kda.py`/`moba.py` are alternative attention modules, not wired
 into the default `TransformerBlock`/`MalvinasModel` — same relationship as
 plan 06 vs plan 07 (GQA, also not implemented; key-reuse was chosen).
 
-Running an actual training job (pretrain → YaRN extension → SFT → optional
-DPO) is intentionally not done yet — that happens last, on real GPU
+## Training
+
+Start a small pretraining run:
+
+```bash
+uv run malvinas-train \
+  --mode pretrain \
+  --preset tiny \
+  --max-examples 1000 \
+  --max-steps 100 \
+  --save-every 25
+```
+
+Continue the same run, restoring model, optimizer, step, random state, and
+the number of consumed data blocks:
+
+```bash
+uv run malvinas-train \
+  --mode pretrain \
+  --resume latest \
+  --max-steps 200
+```
+
+Start a new SFT stage from pretrained weights. This intentionally starts a
+fresh optimizer and step counter:
+
+```bash
+uv run malvinas-train \
+  --mode sft \
+  --init-from checkpoints/pretrain-step-00000200.pt \
+  --max-steps 100
+```
+
+Use `--preset 0.5b`, `--preset 1b-deep`, or `--preset 1b-wide` for the
+larger target configurations. Those presets require appropriate GPU memory;
+`tiny` is intended for pipeline validation. Run `uv run malvinas-train
+--help` for dataset, precision, batch, and checkpoint options.
 
 ## Development
 
 ```bash
 uv sync            # creates .venv, installs dependencies
-uv run pytest       # 59 tests, all green
+uv run pytest
 ```
 
 ## Author

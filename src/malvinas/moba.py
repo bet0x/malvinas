@@ -22,47 +22,48 @@ class MoBAAttention(nn.Module):
     faithful to the source.
     """
 
-    def __init__(self, d_model: int, n_heads: int, chunk_size: int, top_k: int):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        chunk_size: int,
+        top_k: int,
+        query_chunk_size: int = 16,
+    ):
         super().__init__()
         assert d_model % n_heads == 0
+        if chunk_size <= 0 or top_k <= 0 or query_chunk_size <= 0:
+            raise ValueError("chunk_size, top_k and query_chunk_size must be positive")
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.chunk_size = chunk_size
         self.top_k = top_k
+        self.query_chunk_size = query_chunk_size
 
         self.W_q = nn.Linear(d_model, d_model, bias=False)
         self.W_k = nn.Linear(d_model, d_model, bias=False)
         self.W_v = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
-    def _block_gate(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        """q, k: (H, T, D). Returns an additive gate (H, T, T): 0 where a
-        key position's chunk is selected for that query, -inf otherwise."""
-        H, T, D = q.shape
-        C = self.chunk_size
-        num_blocks = math.ceil(T / C)
+    def _select_blocks(
+        self,
+        q: torch.Tensor,
+        chunk_keys: torch.Tensor,
+        query_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return selected block ids as (H, Q, K), never a token-level mask."""
+        H, Q, _ = q.shape
+        num_blocks = chunk_keys.shape[1]
+        gate = torch.einsum("hqd,hnd->hqn", q.float(), chunk_keys.float())
 
-        chunk_keys = torch.stack(
-            [k[:, i * C : min(T, (i + 1) * C)].mean(dim=1) for i in range(num_blocks)], dim=1
-        )  # (H, num_blocks, D) -- one representative key per chunk
+        current_blocks = torch.div(query_positions, self.chunk_size, rounding_mode="floor")
+        block_ids = torch.arange(num_blocks, device=q.device)
+        allowed = block_ids.view(1, 1, -1) <= current_blocks.view(1, Q, 1)
+        gate = gate.masked_fill(~allowed, float("-inf"))
+        current_idx = current_blocks.view(1, Q, 1).expand(H, -1, -1)
+        gate.scatter_(-1, current_idx, float("inf"))
 
-        gate = torch.einsum("htd,hnd->htn", q.float(), chunk_keys.float())  # (H, T, num_blocks)
-
-        for i in range(num_blocks):
-            block_start, block_end = i * C, min(T, (i + 1) * C)
-            gate[:, : block_end, i] = float("-inf")  # exclude: query is <= end of chunk i
-            gate[:, block_start:block_end, i] = float("inf")  # force-include: query's own chunk
-
-        top_k = min(self.top_k, num_blocks)
-        top_vals, top_idx = torch.topk(gate, k=top_k, dim=-1, largest=True)
-        threshold = top_vals.min(dim=-1).values  # (H, T)
-        selected = gate >= threshold.unsqueeze(-1)
-        selected_mask = torch.zeros_like(selected)
-        selected_mask.scatter_(-1, top_idx, True)
-        selected = selected & selected_mask
-
-        block_gate = torch.where(selected, torch.zeros_like(gate), torch.full_like(gate, float("-inf")))
-        return block_gate.repeat_interleave(C, dim=-1)[:, :, :T]  # (H, T, T), token-level
+        return torch.topk(gate, k=min(self.top_k, num_blocks), dim=-1).indices
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -75,14 +76,47 @@ class MoBAAttention(nn.Module):
         k = apply_rotary_emb(k, freqs_cis).permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        causal_mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+        num_blocks = math.ceil(T / self.chunk_size)
+        token_offsets = torch.arange(self.chunk_size, device=x.device)
         outputs = []
         for b in range(B):
-            block_gate = self._block_gate(q[b], k[b])  # (n_h, T, T)
-            scores = (q[b] @ k[b].transpose(-2, -1)) * (d_h ** -0.5) + block_gate
-            scores = scores.masked_fill(~causal_mask, float("-inf"))
-            weights = F.softmax(scores, dim=-1).type_as(v)
-            outputs.append(weights @ v[b])  # (n_h, T, d_h)
+            chunk_keys = torch.stack(
+                [
+                    k[b, :, i * self.chunk_size : min(T, (i + 1) * self.chunk_size)].mean(
+                        dim=1
+                    )
+                    for i in range(num_blocks)
+                ],
+                dim=1,
+            )
+            batch_output = []
+            for start in range(0, T, self.query_chunk_size):
+                end = min(T, start + self.query_chunk_size)
+                query_positions = torch.arange(start, end, device=x.device)
+                q_chunk = q[b, :, start:end]
+                selected_blocks = self._select_blocks(q_chunk, chunk_keys, query_positions)
+
+                token_idx = selected_blocks.unsqueeze(-1) * self.chunk_size + token_offsets
+                token_idx = token_idx.flatten(start_dim=-2)
+                valid = (token_idx < T) & (token_idx <= query_positions.view(1, -1, 1))
+                safe_idx = token_idx.clamp(max=T - 1)
+
+                gather_shape = (*safe_idx.shape, d_h)
+                k_source = k[b].unsqueeze(1).expand(-1, end - start, -1, -1)
+                v_source = v[b].unsqueeze(1).expand(-1, end - start, -1, -1)
+                selected_k = torch.gather(
+                    k_source, 2, safe_idx.unsqueeze(-1).expand(gather_shape)
+                )
+                selected_v = torch.gather(
+                    v_source, 2, safe_idx.unsqueeze(-1).expand(gather_shape)
+                )
+
+                scores = (q_chunk.unsqueeze(-2) * selected_k).sum(dim=-1) * (d_h ** -0.5)
+                scores = scores.masked_fill(~valid, float("-inf"))
+                weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(v.dtype)
+                batch_output.append((weights.unsqueeze(-1) * selected_v).sum(dim=-2))
+
+            outputs.append(torch.cat(batch_output, dim=1))
 
         out = torch.stack(outputs, dim=0).permute(0, 2, 1, 3).reshape(B, T, n_h * d_h)
         return self.out_proj(out)

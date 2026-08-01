@@ -5,3 +5,4 @@ venv/
 *.pt
 *.png
 saved_models/
+/TMP.md

@@ -73,13 +73,26 @@ class MalvinasModel(nn.Module):
         §9), keeping every existing row's weights and the tied output head."""
         old_embedding = self.token_embedding
         old_vocab_size, d_model = old_embedding.weight.shape
+        if new_vocab_size < old_vocab_size:
+            raise ValueError("resize_token_embeddings only supports growing the vocabulary")
 
-        new_embedding = nn.Embedding(new_vocab_size, d_model)
+        new_embedding = nn.Embedding(
+            new_vocab_size,
+            d_model,
+            device=old_embedding.weight.device,
+            dtype=old_embedding.weight.dtype,
+        )
         with torch.no_grad():
             new_embedding.weight[:old_vocab_size] = old_embedding.weight
 
         self.token_embedding = new_embedding
-        self.output_head = nn.Linear(d_model, new_vocab_size, bias=False)
+        self.output_head = nn.Linear(
+            d_model,
+            new_vocab_size,
+            bias=False,
+            device=old_embedding.weight.device,
+            dtype=old_embedding.weight.dtype,
+        )
         self.output_head.weight = self.token_embedding.weight  # re-tie
 
         if self.mtp_head is not None:

@@ -21,6 +21,9 @@ class Tokenizer:
     def decode(self, ids: list[int]) -> str:
         return self._hf_tokenizer.decode(ids)
 
+    def token_to_id(self, token: str) -> int | None:
+        return self._hf_tokenizer.token_to_id(token)
+
     def add_special_tokens(self, tokens: list[str]) -> int:
         """Add new atomic tokens (e.g. tool-call markers, plan 00 §9).
         Returns how many new ids were actually added."""

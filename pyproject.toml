@@ -13,6 +13,9 @@ dependencies = [
     "zstandard>=0.25.0",
 ]
 
+[project.scripts]
+malvinas-train = "malvinas.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",

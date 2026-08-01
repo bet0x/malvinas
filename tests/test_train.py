@@ -109,3 +109,16 @@ def test_compute_loss_with_mask_ignores_masked_positions():
 
     assert torch.isclose(loss_a, loss_b)
     assert torch.isclose(loss_a, expected)
+
+
+def test_compute_loss_with_fully_masked_batch_is_differentiable_zero():
+    logits = torch.randn(2, 3, 8, requires_grad=True)
+    target_ids = torch.randint(0, 8, (2, 3))
+    loss_mask = torch.zeros(2, 3, dtype=torch.bool)
+
+    loss = compute_loss(logits, target_ids, loss_mask)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert loss.item() == 0.0
+    assert torch.equal(logits.grad, torch.zeros_like(logits))

@@ -7,9 +7,7 @@ from malvinas.rope import apply_rotary_emb
 
 
 class Attention(nn.Module):
-    """Causal multi-head attention with RoPE and QK-Norm. Full O(T^2)
-    attention, no windowing/key-reuse/GQA yet — those are separate, later
-    increments."""
+    """Causal multi-head attention with RoPE, QK-Norm and optional windowing."""
 
     def __init__(
         self,
@@ -23,6 +21,8 @@ class Attention(nn.Module):
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
         self.reuse_key_as_value = reuse_key_as_value
+        if window_size is not None and window_size < 0:
+            raise ValueError("window_size must be non-negative")
         self.window_size = window_size
         qkv_out = 2 * d_model if reuse_key_as_value else 3 * d_model
         self.qkv = nn.Linear(d_model, qkv_out, bias=False)
@@ -52,12 +52,23 @@ class Attention(nn.Module):
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        attn_scores = (q @ k.transpose(-2, -1)) * (self.d_k ** -0.5)
-        allowed_mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
-        if self.window_size is not None:
-            allowed_mask &= torch.triu(allowed_mask, diagonal=-self.window_size)
-        attn_scores = attn_scores.masked_fill(~allowed_mask, float("-inf"))
-        attn_weights = F.softmax(attn_scores, dim=-1)
+        if self.window_size is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            left_context = min(self.window_size, T - 1)
+            window_length = left_context + 1
+            padded_k = F.pad(k, (0, 0, left_context, 0))
+            padded_v = F.pad(v, (0, 0, left_context, 0))
+            k_windows = padded_k.unfold(2, window_length, 1).transpose(-2, -1)
+            v_windows = padded_v.unfold(2, window_length, 1).transpose(-2, -1)
 
-        out = (attn_weights @ v).permute(0, 2, 1, 3).contiguous().view(B, T, C)
+            scores = (q.unsqueeze(-2) * k_windows).sum(dim=-1) * (self.d_k ** -0.5)
+            offsets = torch.arange(-left_context, 1, device=x.device)
+            positions = torch.arange(T, device=x.device).unsqueeze(-1)
+            valid = positions + offsets >= 0
+            scores = scores.masked_fill(~valid, float("-inf"))
+            weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+            out = (weights.unsqueeze(-1) * v_windows).sum(dim=-2)
+
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, T, C)
         return self.out_proj(out)

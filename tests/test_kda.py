@@ -51,13 +51,15 @@ def test_first_token_matches_eq1_with_zero_initial_state():
     out = kda(x)
 
     with torch.no_grad():
-        q = torch.nn.functional.normalize(torch.nn.functional.silu(kda.W_q(x)), dim=-1)
-        k = torch.nn.functional.normalize(torch.nn.functional.silu(kda.W_k(x)), dim=-1)
+        q = torch.nn.functional.silu(kda.W_q(x)).view(1, 1, n_heads, d_head)
+        k = torch.nn.functional.silu(kda.W_k(x)).view(1, 1, n_heads, d_head)
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
         v = torch.nn.functional.silu(kda.W_v(x))
         beta = torch.sigmoid(kda.W_beta(x))  # (1,1,n_heads)
 
-        q = q.view(1, 1, n_heads, d_head)[0, 0]  # (n_heads, d_head)
-        k = k.view(1, 1, n_heads, d_head)[0, 0]
+        q = q[0, 0]  # (n_heads, d_head)
+        k = k[0, 0]
         v = v.view(1, 1, n_heads, d_head)[0, 0]
         beta = beta[0, 0]  # (n_heads,)
 
@@ -69,3 +71,17 @@ def test_first_token_matches_eq1_with_zero_initial_state():
         expected_out = kda.out_proj(gate * kda.out_norm(expected_o))
 
     assert torch.allclose(out, expected_out, atol=1e-5)
+
+
+def test_q_and_k_are_normalized_per_head():
+    torch.manual_seed(0)
+    kda = make_kda()
+    x = torch.randn(2, 3, 16)
+
+    q = torch.nn.functional.silu(kda.W_q(x)).view(2, 3, 4, 4)
+    k = torch.nn.functional.silu(kda.W_k(x)).view(2, 3, 4, 4)
+    q = torch.nn.functional.normalize(q, dim=-1)
+    k = torch.nn.functional.normalize(k, dim=-1)
+
+    assert torch.allclose(q.norm(dim=-1), torch.ones(2, 3, 4), atol=1e-6)
+    assert torch.allclose(k.norm(dim=-1), torch.ones(2, 3, 4), atol=1e-6)

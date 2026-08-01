@@ -21,4 +21,6 @@ pointing at the real module/tests in `src/malvinas/`.
 11. [Kimi Delta Attention / linear-attention hybrid (Moonshot)](11-kimi-delta-attention.md) — implemented (alternative module, not wired in as default)
 12. [Mixture of Block Attention (MoBA, Moonshot)](12-moba.md) — implemented (alternative module, not wired in as default)
 
-See `docs/architecture.md` for the target shape these compose into, and
+See `docs/architecture.md` for the target shape these compose into. The
+`malvinas-train` command now runs the pretraining and SFT stages with
+selectable model presets and resumable checkpoints.

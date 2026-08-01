@@ -53,8 +53,10 @@ class KimiDeltaAttention(nn.Module):
         B, T, _ = x.shape
         n_h, d_h = self.n_heads, self.d_head
 
-        q = F.normalize(F.silu(self.W_q(x)), dim=-1).view(B, T, n_h, d_h)
-        k = F.normalize(F.silu(self.W_k(x)), dim=-1).view(B, T, n_h, d_h)
+        q = F.silu(self.W_q(x)).view(B, T, n_h, d_h)
+        k = F.silu(self.W_k(x)).view(B, T, n_h, d_h)
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
         v = F.silu(self.W_v(x)).view(B, T, n_h, d_h)
         alpha = torch.sigmoid(self.W_alpha_up(self.W_alpha_down(x))).view(B, T, n_h, d_h)
         beta = torch.sigmoid(self.W_beta(x))  # (B, T, n_h)
