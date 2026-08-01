@@ -1,5 +1,5 @@
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.nn import functional as F
 
 from malvinas.rope import apply_rotary_emb
