@@ -3,7 +3,12 @@ import torch
 
 import malvinas.cli as cli
 from malvinas.checkpoint import load_checkpoint
-from malvinas.cli import _next_batch, _validate_args, build_parser
+from malvinas.cli import (
+    _next_batch,
+    _resolve_autocast_dtype,
+    _validate_args,
+    build_parser,
+)
 
 
 def test_cli_exposes_pretrain_sft_presets_and_checkpoint_options():
@@ -42,6 +47,25 @@ def test_cli_rejects_model_name_with_path_components():
 
     with pytest.raises(ValueError, match="--model-name"):
         _validate_args(args)
+
+
+def test_cli_validates_token_accumulation_and_float16_device():
+    args = build_parser().parse_args(
+        [
+            "--mode",
+            "pretrain",
+            "--block-size",
+            "8",
+            "--batch-size",
+            "2",
+            "--tokens-per-update",
+            "24",
+        ]
+    )
+    with pytest.raises(ValueError, match="divisible"):
+        _validate_args(args)
+    with pytest.raises(ValueError, match="requires CUDA"):
+        _resolve_autocast_dtype("float16", torch.device("cpu"))
 
 
 def test_sft_name_does_not_repeat_stage_suffix():
@@ -147,3 +171,46 @@ def test_training_can_resume_and_initialize_a_new_stage(tmp_path, monkeypatch):
     assert sft_payload["step"] == 1
     assert sft_path.parent == tmp_path / "models" / "malvinas-tiny-sft" / "checkpoints"
     assert (tmp_path / "models" / "malvinas-tiny-sft" / "model.pt").exists()
+
+
+def test_training_accumulates_to_requested_token_batch(tmp_path, monkeypatch):
+    class FakeTokenizer:
+        vocab_size = 32
+
+        def __init__(self, _repo_id):
+            pass
+
+        def token_to_id(self, _token):
+            return 0
+
+    def fake_blocks(run_config, _tokenizer):
+        # Seven blocks make the last micro-batch contain one of two blocks.
+        for offset in range(7):
+            inputs = torch.arange(run_config["block_size"]) % 32
+            yield inputs, (inputs + offset + 1) % 32, None
+
+    monkeypatch.setattr(cli, "Tokenizer", FakeTokenizer)
+    monkeypatch.setattr(cli, "_block_stream", fake_blocks)
+    args = build_parser().parse_args(
+        [
+            "--mode",
+            "pretrain",
+            "--block-size",
+            "4",
+            "--batch-size",
+            "2",
+            "--tokens-per-update",
+            "16",
+            "--max-steps",
+            "2",
+            "--models-dir",
+            str(tmp_path / "models"),
+        ]
+    )
+
+    payload = load_checkpoint(cli.run_training(args))
+
+    assert payload["step"] == 2
+    assert payload["blocks_consumed"] == 7
+    assert payload["run_config"]["training"]["tokens_per_update"] == 16
+    assert payload["scheduler_state_dict"]["step_num"] == 2

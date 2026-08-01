@@ -50,12 +50,24 @@ uv run malvinas-train \
   --preset tiny \
   --model-name malvinas-tiny \
   --max-examples 1000 \
+  --block-size 256 \
+  --batch-size 2 \
+  --tokens-per-update 2048 \
   --max-steps 100 \
+  --warmup-steps 10 \
   --save-every 25
 ```
 
-Continue the same run, restoring model, optimizer, step, random state, and
-the number of consumed data blocks:
+`--tokens-per-update` defines the effective batch and uses gradient
+accumulation when it is larger than `batch-size * block-size`. `--max-steps`
+counts optimizer updates, not micro-batches. The default AdamW setup applies
+weight decay to matrix parameters, keeps scalar parameters un-decayed, and
+supports separate embedding decay, betas, cosine LR decay, and gradient
+clipping through CLI options. `--precision auto` prefers BF16 on supported
+CUDA hardware and otherwise uses scaled FP16 on CUDA or FP32 on CPU.
+
+Continue the same run, restoring model, optimizer, scheduler, GradScaler,
+step, random state, and the number of consumed data blocks:
 
 ```bash
 uv run malvinas-train \
@@ -89,9 +101,10 @@ models/
 ```
 
 `model.pt` contains the final weights and model metadata for inference. Each
-checkpoint also includes optimizer, progress, and random state so training can
-resume exactly. Use `--model-name` to choose the directory name, `--models-dir`
-to change the `models/` root, or `--checkpoint-dir` as an explicit override.
+checkpoint also includes optimizer, scheduler, mixed-precision scaler,
+progress, and random state so training can resume exactly. Use `--model-name`
+to choose the directory name, `--models-dir` to change the `models/` root, or
+`--checkpoint-dir` as an explicit override.
 
 Use `--preset 0.5b`, `--preset 1b-deep`, or `--preset 1b-wide` for the
 larger target configurations. Those presets require appropriate GPU memory;

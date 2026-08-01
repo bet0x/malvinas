@@ -76,10 +76,20 @@ class MoEFeedForward(nn.Module):
         return out
 
     @torch.no_grad()
-    def update_expert_bias(self, update_rate: float) -> None:
+    def update_expert_bias(
+        self,
+        update_rate: float,
+        counts: torch.Tensor | None = None,
+    ) -> None:
         """DeepSeek-V3-style auxiliary-loss-free balancing: nudge each
-        expert's bias down if it took more than its uniform share of the
-        last forward's selections, up if it took less. No gradient."""
-        counts = torch.bincount(self.last_selected_experts, minlength=self.num_experts).float()
+        expert's bias down if it took more than its uniform share, up if it
+        took less. No gradient."""
+        if counts is None:
+            if self.last_selected_experts is None:
+                return
+            counts = torch.bincount(
+                self.last_selected_experts,
+                minlength=self.num_experts,
+            ).float()
         target = counts.sum() / self.num_experts
         self.expert_bias -= update_rate * torch.sign(counts - target)

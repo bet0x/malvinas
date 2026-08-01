@@ -1,8 +1,18 @@
+import pytest
 import torch
 from torch.nn import functional as F
 
 from malvinas.model import MalvinasModel
-from malvinas.train import compute_loss, train_step
+from malvinas.train import (
+    WarmupCosineScheduler,
+    accumulate_expert_counts,
+    build_optimizer,
+    compute_loss,
+    compute_training_loss,
+    optimizer_step,
+    train_step,
+    update_expert_bias,
+)
 
 
 def make_tiny_model():
@@ -80,6 +90,32 @@ def test_train_step_with_mtp_target_trains_the_mtp_head():
     assert model.mtp_head.combine_proj.weight.grad.abs().sum() > 0
 
 
+def test_expert_count_accumulation_skips_unused_mtp_head():
+    model = MalvinasModel(
+        vocab_size=16,
+        d_model=16,
+        n_layers=2,
+        n_heads=2,
+        num_experts=4,
+        top_k=2,
+        expert_dim=32,
+        max_seq_len=8,
+        rope_theta=10000.0,
+        mtp_depth=1,
+    )
+    model(torch.randint(0, 16, (2, 6)))
+
+    counts = accumulate_expert_counts(model)
+    assert len(counts) == len(model.blocks)
+    assert model.mtp_head.block.moe not in counts
+
+    update_expert_bias(model, counts)
+    assert torch.equal(
+        model.mtp_head.block.moe.expert_bias,
+        torch.zeros_like(model.mtp_head.block.moe.expert_bias),
+    )
+
+
 def test_compute_loss_without_mask_matches_plain_cross_entropy():
     torch.manual_seed(0)
     logits = torch.randn(2, 4, 16)
@@ -122,3 +158,97 @@ def test_compute_loss_with_fully_masked_batch_is_differentiable_zero():
     assert torch.isfinite(loss)
     assert loss.item() == 0.0
     assert torch.equal(logits.grad, torch.zeros_like(logits))
+
+
+def test_warmup_cosine_scheduler_reaches_floor_and_restores_state():
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0)
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        max_lr=1.0,
+        min_lr=0.1,
+        warmup_steps=2,
+        decay_steps=6,
+    )
+
+    rates = [optimizer.param_groups[0]["lr"]]
+    for _ in range(6):
+        scheduler.step()
+        rates.append(optimizer.param_groups[0]["lr"])
+
+    assert rates[:3] == pytest.approx([0.5, 1.0, 1.0])
+    assert rates[-1] == pytest.approx(0.1)
+
+    restored = WarmupCosineScheduler(
+        optimizer,
+        max_lr=2.0,
+        min_lr=0.0,
+        warmup_steps=0,
+        decay_steps=1,
+    )
+    restored.load_state_dict(scheduler.state_dict())
+    assert restored.step_num == scheduler.step_num
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+
+
+def test_build_optimizer_groups_parameters_once_with_expected_decay():
+    model = make_tiny_model()
+    optimizer = build_optimizer(
+        model,
+        learning_rate=3e-4,
+        weight_decay=0.1,
+        embedding_weight_decay=0.02,
+    )
+    groups = {group["group_name"]: group for group in optimizer.param_groups}
+    parameter_ids = [
+        id(parameter)
+        for group in groups.values()
+        for parameter in group["params"]
+    ]
+
+    assert len(parameter_ids) == len(set(parameter_ids)) == len(
+        list(model.parameters())
+    )
+    assert model.token_embedding.weight in groups["embedding"]["params"]
+    assert groups["matrix"]["weight_decay"] == pytest.approx(0.1)
+    assert groups["embedding"]["weight_decay"] == pytest.approx(0.02)
+    assert groups["scalar"]["weight_decay"] == 0.0
+
+
+def test_optimizer_step_clips_gradients_and_rejects_nonfinite_values():
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    for parameter in model.parameters():
+        parameter.grad = torch.full_like(parameter, 100.0)
+
+    original_norm = optimizer_step(model, optimizer, max_grad_norm=0.5)
+    clipped_norm = torch.linalg.vector_norm(
+        torch.cat([parameter.grad.flatten() for parameter in model.parameters()])
+    )
+    assert original_norm > 0.5
+    assert clipped_norm <= 0.50001
+
+    optimizer.zero_grad(set_to_none=True)
+    parameter = next(model.parameters())
+    parameter.grad = torch.full_like(parameter, float("nan"))
+    with pytest.raises(FloatingPointError, match="non-finite gradients"):
+        optimizer_step(model, optimizer, max_grad_norm=1.0)
+
+
+def test_compute_training_loss_rejects_nonfinite_loss():
+    class NonFiniteModel(torch.nn.Module):
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            shape = (*input_ids.shape, 4)
+            return torch.full(shape, float("nan"), device=input_ids.device)
+
+    input_ids = torch.tensor([[0, 1]])
+    target_ids = torch.tensor([[1, 2]])
+    loss_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    with pytest.raises(FloatingPointError, match="non-finite training loss"):
+        compute_training_loss(
+            NonFiniteModel(),
+            input_ids,
+            target_ids,
+            loss_mask,
+        )

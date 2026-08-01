@@ -4,7 +4,8 @@ from pathlib import Path
 import torch
 from torch import nn
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
+SUPPORTED_CHECKPOINT_VERSIONS = (1, CHECKPOINT_VERSION)
 MODEL_VERSION = 1
 
 
@@ -30,6 +31,8 @@ def save_checkpoint(
     mode: str,
     model_config: dict,
     run_config: dict,
+    scheduler=None,
+    grad_scaler: torch.amp.GradScaler | None = None,
 ) -> Path:
     """Atomically save everything required to resume a training run."""
     destination = Path(checkpoint_dir) / checkpoint_filename(mode, step)
@@ -44,6 +47,10 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "torch_rng_state": torch.get_rng_state(),
     }
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    if grad_scaler is not None:
+        payload["grad_scaler_state_dict"] = grad_scaler.state_dict()
     if torch.cuda.is_available():
         payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
     return _atomic_save(payload, destination)
@@ -87,12 +94,52 @@ def load_checkpoint(path: str | Path) -> dict:
     missing = required.difference(payload)
     if missing:
         raise ValueError(f"invalid checkpoint, missing: {', '.join(sorted(missing))}")
-    if payload["version"] != CHECKPOINT_VERSION:
+    if payload["version"] not in SUPPORTED_CHECKPOINT_VERSIONS:
         raise ValueError(
             f"unsupported checkpoint version {payload['version']} "
-            f"(expected {CHECKPOINT_VERSION})"
+            f"(expected one of {SUPPORTED_CHECKPOINT_VERSIONS})"
         )
     return payload
+
+
+def _load_optimizer_state(
+    payload: dict,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> None:
+    saved_state = payload["optimizer_state_dict"]
+    try:
+        optimizer.load_state_dict(saved_state)
+        return
+    except ValueError:
+        if payload["version"] != 1:
+            raise
+
+    old_parameter_ids = [
+        parameter_id
+        for group in saved_state["param_groups"]
+        for parameter_id in group["params"]
+    ]
+    model_parameters = list(model.parameters())
+    if len(old_parameter_ids) != len(model_parameters):
+        raise ValueError("cannot migrate the version 1 optimizer parameter layout")
+
+    old_state_by_parameter = {
+        id(parameter): saved_state["state"].get(parameter_id, {})
+        for parameter, parameter_id in zip(model_parameters, old_parameter_ids)
+    }
+    migrated = optimizer.state_dict()
+    migrated["state"] = {}
+    for live_group, serialized_group in zip(
+        optimizer.param_groups, migrated["param_groups"]
+    ):
+        for parameter, parameter_id in zip(
+            live_group["params"], serialized_group["params"]
+        ):
+            state = old_state_by_parameter.get(id(parameter))
+            if state:
+                migrated["state"][parameter_id] = state
+    optimizer.load_state_dict(migrated)
 
 
 def restore_checkpoint(
@@ -100,13 +147,19 @@ def restore_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scheduler=None,
+    grad_scaler: torch.amp.GradScaler | None = None,
 ) -> None:
     model.load_state_dict(payload["model_state_dict"])
-    optimizer.load_state_dict(payload["optimizer_state_dict"])
+    _load_optimizer_state(payload, model, optimizer)
     for state in optimizer.state.values():
         for key, value in state.items():
             if isinstance(value, torch.Tensor):
                 state[key] = value.to(device)
+    if scheduler is not None and "scheduler_state_dict" in payload:
+        scheduler.load_state_dict(payload["scheduler_state_dict"])
+    if grad_scaler is not None and "grad_scaler_state_dict" in payload:
+        grad_scaler.load_state_dict(payload["grad_scaler_state_dict"])
     if "torch_rng_state" in payload:
         torch.set_rng_state(payload["torch_rng_state"])
     if device.type == "cuda" and "cuda_rng_state_all" in payload:

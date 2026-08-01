@@ -10,6 +10,7 @@ from malvinas.checkpoint import (
     save_model,
 )
 from malvinas.config import model_config_from_preset
+from malvinas.train import WarmupCosineScheduler, build_optimizer
 
 
 def make_model_and_optimizer():
@@ -87,3 +88,84 @@ def test_save_model_writes_inference_artifact_without_optimizer(tmp_path: Path):
     assert payload["model_name"] == "malvinas-tiny"
     assert "model_state_dict" in payload
     assert "optimizer_state_dict" not in payload
+
+
+def test_checkpoint_restores_scheduler_state(tmp_path: Path):
+    config = model_config_from_preset("tiny", 32, 8)
+    model = config.build()
+    optimizer = build_optimizer(model, learning_rate=1e-3, weight_decay=0.1)
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        max_lr=1e-3,
+        min_lr=1e-4,
+        warmup_steps=2,
+        decay_steps=10,
+    )
+    scheduler.step()
+    path = save_checkpoint(
+        tmp_path,
+        model,
+        optimizer,
+        step=1,
+        blocks_consumed=2,
+        mode="pretrain",
+        model_config=config.to_dict(),
+        run_config={"tokenizer": "test", "block_size": 8},
+        scheduler=scheduler,
+    )
+
+    restored_model = config.build()
+    restored_optimizer = build_optimizer(
+        restored_model, learning_rate=1e-3, weight_decay=0.1
+    )
+    restored_scheduler = WarmupCosineScheduler(
+        restored_optimizer,
+        max_lr=1e-3,
+        min_lr=1e-4,
+        warmup_steps=2,
+        decay_steps=10,
+    )
+    restore_checkpoint(
+        load_checkpoint(path),
+        restored_model,
+        restored_optimizer,
+        torch.device("cpu"),
+        scheduler=restored_scheduler,
+    )
+
+    assert restored_scheduler.step_num == 1
+    assert restored_optimizer.param_groups[0]["lr"] == scheduler.learning_rate()
+
+
+def test_version_one_checkpoint_migrates_flat_optimizer_state(tmp_path: Path):
+    config = model_config_from_preset("tiny", 32, 8)
+    model, optimizer = make_model_and_optimizer()
+    model(torch.randint(0, 32, (1, 4))).sum().backward()
+    optimizer.step()
+    path = save_checkpoint(
+        tmp_path,
+        model,
+        optimizer,
+        step=3,
+        blocks_consumed=3,
+        mode="pretrain",
+        model_config=config.to_dict(),
+        run_config={"tokenizer": "test", "block_size": 8},
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["version"] = 1
+    torch.save(payload, path)
+
+    restored_model = config.build()
+    grouped_optimizer = build_optimizer(
+        restored_model, learning_rate=1e-3, weight_decay=0.1
+    )
+    restore_checkpoint(
+        load_checkpoint(path),
+        restored_model,
+        grouped_optimizer,
+        torch.device("cpu"),
+    )
+
+    assert grouped_optimizer.state
+    assert len(grouped_optimizer.param_groups) == 3

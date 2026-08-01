@@ -21,7 +21,16 @@ from malvinas.data import (
     xlam_to_messages,
 )
 from malvinas.tokenizer import DEFAULT_REPO_ID, Tokenizer
-from malvinas.train import train_step
+from malvinas.train import (
+    WarmupCosineScheduler,
+    accumulate_expert_counts,
+    backward_loss,
+    build_optimizer,
+    compute_training_loss,
+    optimizer_step,
+    rescale_gradients,
+    update_expert_bias,
+)
 
 DEFAULT_PRETRAIN_DATASET = "allenai/dolma3_mix-150B-1025"
 DEFAULT_SFT_DATASET = "HuggingFaceTB/smoltalk"
@@ -45,8 +54,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-examples", type=int)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--tokens-per-update",
+        type=int,
+        help="Global token batch. Must be divisible by batch-size * block-size.",
+    )
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1)
+    parser.add_argument("--warmup-steps", type=int)
+    parser.add_argument("--lr-decay-steps", type=int)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--embedding-weight-decay", type=float, default=0.0)
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.95)
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=1.0,
+        help="Gradient clipping norm; use 0 to disable clipping.",
+    )
     parser.add_argument(
         "--model-name",
         help="Output model name (default: malvinas-{preset}, with -sft for SFT).",
@@ -69,7 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--precision", choices=("auto", "float32", "bfloat16"), default="auto")
+    parser.add_argument(
+        "--precision",
+        choices=("auto", "float32", "bfloat16", "float16"),
+        default="auto",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -82,6 +113,26 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.learning_rate <= 0:
         raise ValueError("--learning-rate must be positive")
+    if args.tokens_per_update is not None:
+        micro_batch_tokens = args.batch_size * args.block_size
+        if args.tokens_per_update < micro_batch_tokens:
+            raise ValueError("--tokens-per-update cannot be smaller than one micro-batch")
+        if args.tokens_per_update % micro_batch_tokens:
+            raise ValueError(
+                "--tokens-per-update must be divisible by batch-size * block-size"
+            )
+    if args.warmup_steps is not None and args.warmup_steps < 0:
+        raise ValueError("--warmup-steps must be non-negative")
+    if args.lr_decay_steps is not None and args.lr_decay_steps <= 0:
+        raise ValueError("--lr-decay-steps must be positive")
+    if not 0.0 <= args.min_lr_ratio <= 1.0:
+        raise ValueError("--min-lr-ratio must be between zero and one")
+    if args.weight_decay < 0 or args.embedding_weight_decay < 0:
+        raise ValueError("weight decay values must be non-negative")
+    if not 0.0 <= args.beta1 < 1.0 or not 0.0 <= args.beta2 < 1.0:
+        raise ValueError("--beta1 and --beta2 must be in [0, 1)")
+    if args.max_grad_norm < 0:
+        raise ValueError("--max-grad-norm must be non-negative")
     if args.model_name and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.model_name):
         raise ValueError(
             "--model-name must start with a letter or digit and contain only "
@@ -123,8 +174,12 @@ def _resolve_autocast_dtype(value: str, device: torch.device) -> torch.dtype | N
         if device.type != "cuda":
             raise ValueError("bfloat16 training currently requires CUDA")
         return torch.bfloat16
-    if device.type == "cuda" and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
+    if value == "float16":
+        if device.type != "cuda":
+            raise ValueError("float16 training requires CUDA")
+        return torch.float16
+    if device.type == "cuda":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     return None
 
 
@@ -162,6 +217,32 @@ def _new_run_config(
         "max_examples": args.max_examples,
         "block_size": args.block_size,
         "batch_size": args.batch_size,
+        "training": _training_config(args),
+    }
+
+
+def _training_config(args: argparse.Namespace) -> dict:
+    micro_batch_tokens = args.batch_size * args.block_size
+    tokens_per_update = args.tokens_per_update or micro_batch_tokens
+    warmup_steps = (
+        args.warmup_steps
+        if args.warmup_steps is not None
+        else min(100, args.max_steps // 100)
+    )
+    decay_steps = args.lr_decay_steps or args.max_steps
+    if decay_steps <= warmup_steps:
+        raise ValueError("LR decay steps must be greater than warmup steps")
+    return {
+        "tokens_per_update": tokens_per_update,
+        "learning_rate": args.learning_rate,
+        "min_lr_ratio": args.min_lr_ratio,
+        "warmup_steps": warmup_steps,
+        "lr_decay_steps": decay_steps,
+        "weight_decay": args.weight_decay,
+        "embedding_weight_decay": args.embedding_weight_decay,
+        "betas": (args.beta1, args.beta2),
+        "max_grad_norm": args.max_grad_norm,
+        "precision": args.precision,
     }
 
 
@@ -227,7 +308,6 @@ def _skip_blocks(blocks: Iterator[Block], count: int) -> None:
 def run_training(args: argparse.Namespace) -> Path:
     _validate_args(args)
     device = _resolve_device(args.device)
-    autocast_dtype = _resolve_autocast_dtype(args.precision, device)
     torch.manual_seed(args.seed)
 
     model_name = args.model_name or _default_model_name(args)
@@ -274,6 +354,11 @@ def run_training(args: argparse.Namespace) -> Path:
         run_config.setdefault("model_name", model_name)
     else:
         run_config = _new_run_config(args, tokenizer, model_name)
+    training_config = run_config.get("training")
+    if training_config is None:
+        training_config = _training_config(args)
+        run_config["training"] = training_config
+    autocast_dtype = _resolve_autocast_dtype(training_config["precision"], device)
 
     if source_payload:
         model_config = ModelConfig.from_dict(source_payload["model_config"])
@@ -289,43 +374,123 @@ def run_training(args: argparse.Namespace) -> Path:
         )
 
     model = model_config.build().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = build_optimizer(
+        model,
+        learning_rate=training_config["learning_rate"],
+        weight_decay=training_config["weight_decay"],
+        embedding_weight_decay=training_config["embedding_weight_decay"],
+        betas=tuple(training_config["betas"]),
+    )
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        max_lr=training_config["learning_rate"],
+        min_lr=training_config["learning_rate"] * training_config["min_lr_ratio"],
+        warmup_steps=training_config["warmup_steps"],
+        decay_steps=training_config["lr_decay_steps"],
+    )
+    grad_scaler = torch.amp.GradScaler(
+        device.type, enabled=autocast_dtype == torch.float16
+    )
     step = 0
     blocks_consumed = 0
     if resume_payload:
-        restore_checkpoint(resume_payload, model, optimizer, device)
+        restore_checkpoint(
+            resume_payload,
+            model,
+            optimizer,
+            device,
+            scheduler=scheduler,
+            grad_scaler=grad_scaler,
+        )
         step = resume_payload["step"]
         blocks_consumed = resume_payload["blocks_consumed"]
+        if "scheduler_state_dict" not in resume_payload:
+            scheduler.set_step(step)
     elif init_payload:
         model.load_state_dict(init_payload["model_state_dict"])
 
     blocks = _block_stream(run_config, tokenizer)
     _skip_blocks(blocks, blocks_consumed)
+    micro_batch_tokens = run_config["batch_size"] * run_config["block_size"]
+    tokens_per_update = training_config["tokens_per_update"]
+    if tokens_per_update % micro_batch_tokens:
+        raise ValueError(
+            "checkpoint tokens_per_update is not divisible by its micro-batch size"
+        )
+    accumulation_steps = tokens_per_update // micro_batch_tokens
     last_checkpoint = None
     last_saved_step = -1
 
     while step < args.max_steps:
-        result = _next_batch(blocks, run_config["batch_size"])
-        if result is None:
-            break
-        (input_ids, target_ids, loss_mask), consumed = result
-        input_ids = input_ids.to(device)
-        target_ids = target_ids.to(device)
-        if loss_mask is not None:
-            loss_mask = loss_mask.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        accumulated_loss = 0.0
+        accumulated_loss_tokens = 0
+        expert_counts = None
+        micro_steps = 0
+        update_blocks = 0
+        for _ in range(accumulation_steps):
+            result = _next_batch(blocks, run_config["batch_size"])
+            if result is None:
+                break
+            (input_ids, target_ids, loss_mask), consumed = result
+            input_ids = input_ids.to(device)
+            target_ids = target_ids.to(device)
+            if loss_mask is not None:
+                loss_mask = loss_mask.to(device)
 
-        loss = train_step(
+            loss = compute_training_loss(
+                model,
+                input_ids,
+                target_ids,
+                loss_mask,
+                autocast_dtype=autocast_dtype,
+            )
+            loss_tokens = (
+                int(loss_mask.sum().item())
+                if loss_mask is not None
+                else target_ids.numel()
+            )
+            if loss_tokens:
+                backward_loss(
+                    loss,
+                    divisor=tokens_per_update / loss_tokens,
+                    grad_scaler=grad_scaler,
+                )
+            expert_counts = accumulate_expert_counts(model, expert_counts)
+            accumulated_loss += loss.item() * loss_tokens
+            accumulated_loss_tokens += loss_tokens
+            micro_steps += 1
+            update_blocks += consumed
+            blocks_consumed += consumed
+
+        if micro_steps == 0:
+            break
+        if accumulated_loss_tokens == 0:
+            continue
+        if accumulated_loss_tokens != tokens_per_update:
+            rescale_gradients(
+                model.parameters(),
+                tokens_per_update / accumulated_loss_tokens,
+            )
+        grad_norm = optimizer_step(
             model,
             optimizer,
-            input_ids,
-            target_ids,
-            loss_mask,
-            autocast_dtype=autocast_dtype,
+            max_grad_norm=training_config["max_grad_norm"] or None,
+            grad_scaler=grad_scaler,
         )
+        update_expert_bias(model, expert_counts)
+        learning_rate = optimizer.param_groups[0]["lr"]
+        scheduler.step()
         step += 1
-        blocks_consumed += consumed
+        mean_loss = accumulated_loss / accumulated_loss_tokens
         if step == 1 or step % args.log_every == 0:
-            print(f"step={step} loss={loss:.6f} blocks={blocks_consumed}", flush=True)
+            print(
+                f"step={step} loss={mean_loss:.6f} lr={learning_rate:.3e} "
+                f"grad_norm={grad_norm:.4f} "
+                f"tokens={update_blocks * run_config['block_size']} "
+                f"blocks={blocks_consumed}",
+                flush=True,
+            )
         if step % args.save_every == 0:
             last_checkpoint = save_checkpoint(
                 checkpoint_dir,
@@ -336,6 +501,8 @@ def run_training(args: argparse.Namespace) -> Path:
                 mode=args.mode,
                 model_config=model_config.to_dict(),
                 run_config=run_config,
+                scheduler=scheduler,
+                grad_scaler=grad_scaler,
             )
             last_saved_step = step
             print(f"checkpoint={last_checkpoint}", flush=True)
@@ -352,6 +519,8 @@ def run_training(args: argparse.Namespace) -> Path:
             mode=args.mode,
             model_config=model_config.to_dict(),
             run_config=run_config,
+            scheduler=scheduler,
+            grad_scaler=grad_scaler,
         )
         print(f"checkpoint={last_checkpoint}", flush=True)
     model_path = save_model(
