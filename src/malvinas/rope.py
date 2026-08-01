@@ -30,7 +30,12 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
 
     x_complex = torch.view_as_complex(x_rot.float().reshape(*x_rot.shape[:-1], -1, 2))
-    freqs_cis_bthd = freqs_cis.unsqueeze(0).unsqueeze(2)  # (1, T, 1, rotary_dim/2)
+    if freqs_cis.ndim == 2:
+        freqs_cis_bthd = freqs_cis.unsqueeze(0).unsqueeze(2)
+    elif freqs_cis.ndim == 3:
+        freqs_cis_bthd = freqs_cis.unsqueeze(2)
+    else:
+        raise ValueError("freqs_cis must have shape (T, D) or (B, T, D)")
     x_rotated = x_complex * freqs_cis_bthd
     x_rotated = torch.view_as_real(x_rotated).flatten(-2).type_as(x)
 

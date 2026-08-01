@@ -17,7 +17,14 @@ def _atomic_save(payload: dict, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     torch.save(payload, temporary)
+    with temporary.open("rb") as handle:
+        os.fsync(handle.fileno())
     os.replace(temporary, destination)
+    directory_fd = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
     return destination
 
 
@@ -33,9 +40,13 @@ def save_checkpoint(
     run_config: dict,
     scheduler=None,
     grad_scaler: torch.amp.GradScaler | None = None,
+    filename: str | None = None,
+    extra_state: dict | None = None,
 ) -> Path:
     """Atomically save everything required to resume a training run."""
-    destination = Path(checkpoint_dir) / checkpoint_filename(mode, step)
+    destination = Path(checkpoint_dir) / (
+        filename or checkpoint_filename(mode, step)
+    )
     payload = {
         "version": CHECKPOINT_VERSION,
         "step": step,
@@ -53,7 +64,26 @@ def save_checkpoint(
         payload["grad_scaler_state_dict"] = grad_scaler.state_dict()
     if torch.cuda.is_available():
         payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    if extra_state:
+        payload["extra_state"] = extra_state
     return _atomic_save(payload, destination)
+
+
+def prune_checkpoints(
+    checkpoint_dir: str | Path,
+    mode: str,
+    keep_last: int,
+) -> list[Path]:
+    """Delete older periodic checkpoints while preserving named artifacts."""
+    if keep_last < 0:
+        raise ValueError("keep_last must be non-negative")
+    if keep_last == 0:
+        return []
+    candidates = sorted(Path(checkpoint_dir).glob(f"{mode}-step-*.pt"))
+    removed = candidates[:-keep_last]
+    for path in removed:
+        path.unlink()
+    return removed
 
 
 def save_model(

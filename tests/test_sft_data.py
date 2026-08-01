@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from malvinas.data import build_sft_example, stream_sft_examples, xlam_to_messages
@@ -45,6 +46,7 @@ def test_masked_example_plugs_into_compute_loss():
     assert torch.isfinite(loss)
 
 
+@pytest.mark.integration
 def test_stream_sft_examples_yields_real_smoltalk_conversations():
     """Integration test against the real SmolTalk stream (network): each
     yielded example must be a valid (input_ids, loss_mask) pair with at
@@ -60,6 +62,7 @@ def test_stream_sft_examples_yields_real_smoltalk_conversations():
         assert any(loss_mask)
 
 
+@pytest.mark.integration
 def test_stream_sft_examples_yields_real_dolci_think_conversations():
     """Dolci-Think-SFT-32B (plan 00 §10, reasoning traces) uses the same
     {messages: [{role, content}]} shape as SmolTalk -- no adapter, no
@@ -93,6 +96,7 @@ def test_xlam_to_messages_builds_system_user_assistant_turns():
     assert "<|tool_call|>" in messages[2]["content"]
 
 
+@pytest.mark.integration
 def test_stream_sft_examples_with_xlam_adapter_yields_real_tool_call_examples():
     """Integration test against the real xLAM function-calling stream:
     the assistant's masked-in span must contain the tool-call marker,

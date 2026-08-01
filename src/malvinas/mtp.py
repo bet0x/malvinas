@@ -20,20 +20,34 @@ class MTPHead(nn.Module):
         expert_dim: int,
         token_embedding: nn.Embedding,
         output_head: nn.Linear,
+        moe_kernel: str = "auto",
+        document_attention_backend: str = "auto",
     ):
         super().__init__()
         self.token_embedding = token_embedding
         self.output_head = output_head
         self.combine_proj = nn.Linear(2 * d_model, d_model, bias=False)
         self.combine_norm = RMSNorm(d_model)
-        self.block = TransformerBlock(d_model, n_heads, num_experts, top_k, expert_dim)
+        self.block = TransformerBlock(
+            d_model,
+            n_heads,
+            num_experts,
+            top_k,
+            expert_dim,
+            moe_kernel=moe_kernel,
+            document_attention_backend=document_attention_backend,
+        )
         self.final_norm = RMSNorm(d_model)
 
     def forward(
-        self, hidden_state: torch.Tensor, next_token_ids: torch.Tensor, freqs_cis: torch.Tensor
+        self,
+        hidden_state: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        document_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         next_emb = self.token_embedding(next_token_ids)
         combined = self.combine_norm(self.combine_proj(torch.cat([hidden_state, next_emb], dim=-1)))
-        out = self.block(combined, freqs_cis)
+        out = self.block(combined, freqs_cis, document_ids=document_ids)
         out = self.final_norm(out)
         return self.output_head(out)

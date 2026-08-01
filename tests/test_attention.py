@@ -1,7 +1,46 @@
 import torch
+import pytest
 
 from malvinas.attention import Attention
 from malvinas.rope import apply_rotary_emb, precompute_freqs_cis
+
+
+@pytest.mark.parametrize("window_size", [None, 3])
+def test_document_mask_isolates_packed_sequences(window_size):
+    torch.manual_seed(0)
+    attn = Attention(8, 2, window_size=window_size)
+    all_freqs = precompute_freqs_cis(4, max_seq_len=4, theta=10000.0)
+    position_ids = torch.tensor([[0, 1, 0, 1]])
+    freqs_cis = all_freqs[position_ids]
+    document_ids = torch.tensor([[0, 0, 1, 1]])
+    x = torch.randn(1, 4, 8)
+
+    output = attn(x, freqs_cis, document_ids=document_ids)
+    changed = x.clone()
+    changed[:, :2] = torch.randn_like(changed[:, :2])
+    changed_output = attn(changed, freqs_cis, document_ids=document_ids)
+
+    assert torch.allclose(output[:, 2:], changed_output[:, 2:], atol=1e-6)
+
+
+def test_flex_document_attention_matches_sdpa_fallback():
+    torch.manual_seed(0)
+    sdpa = Attention(8, 2, document_attention_backend="sdpa")
+    flex = Attention(8, 2, document_attention_backend="flex")
+    flex.load_state_dict(sdpa.state_dict())
+    all_freqs = precompute_freqs_cis(4, max_seq_len=8, theta=10000.0)
+    document_ids = torch.tensor(
+        [[0, 0, 0, 1, 1, 2, 2, 2], [0, 0, 1, 1, 1, 1, 2, 2]]
+    )
+    position_ids = torch.tensor(
+        [[0, 1, 2, 0, 1, 0, 1, 2], [0, 1, 0, 1, 2, 3, 0, 1]]
+    )
+    x = torch.randn(2, 8, 8)
+
+    expected = sdpa(x, all_freqs[position_ids], document_ids=document_ids)
+    actual = flex(x, all_freqs[position_ids], document_ids=document_ids)
+
+    assert torch.allclose(actual, expected, atol=1e-5)
 
 
 def test_output_shape_matches_input():

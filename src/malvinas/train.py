@@ -163,6 +163,8 @@ def compute_training_loss(
     mtp_target_ids: torch.Tensor | None = None,
     mtp_weight: float = 0.1,
     autocast_dtype: torch.dtype | None = None,
+    position_ids: torch.Tensor | None = None,
+    document_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device_type = input_ids.device.type
     with torch.autocast(
@@ -170,13 +172,22 @@ def compute_training_loss(
         dtype=autocast_dtype,
         enabled=autocast_dtype is not None,
     ):
+        sequence_kwargs = {}
+        if position_ids is not None:
+            sequence_kwargs["position_ids"] = position_ids
+        if document_ids is not None:
+            sequence_kwargs["document_ids"] = document_ids
         if mtp_target_ids is not None:
-            logits, mtp_logits = model.forward_with_mtp(input_ids, target_ids)
+            logits, mtp_logits = model.forward_with_mtp(
+                input_ids,
+                target_ids,
+                **sequence_kwargs,
+            )
             loss = compute_loss(logits, target_ids, loss_mask) + mtp_weight * compute_loss(
                 mtp_logits, mtp_target_ids, loss_mask
             )
         else:
-            logits = model(input_ids)
+            logits = model(input_ids, **sequence_kwargs)
             loss = compute_loss(logits, target_ids, loss_mask)
     if not torch.isfinite(loss):
         raise FloatingPointError(f"non-finite training loss: {loss.item()}")
@@ -268,6 +279,23 @@ def update_expert_bias(
             if expert_counts is not None and counts is None:
                 continue
             module.update_expert_bias(EXPERT_BIAS_UPDATE_RATE, counts=counts)
+
+
+def expert_load_statistics(
+    expert_counts: dict[MoEFeedForward, torch.Tensor] | None,
+) -> dict[str, float]:
+    """Summarize router balance across all experts used in an update."""
+    if not expert_counts:
+        return {}
+    counts = torch.cat([value.detach().float().cpu() for value in expert_counts.values()])
+    mean = counts.mean()
+    if mean == 0:
+        return {}
+    return {
+        "expert_load_cv": float(counts.std(unbiased=False) / mean),
+        "expert_load_min": float(counts.min()),
+        "expert_load_max": float(counts.max()),
+    }
 
 
 def train_step(

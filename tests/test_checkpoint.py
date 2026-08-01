@@ -5,6 +5,7 @@ import torch
 from malvinas.checkpoint import (
     latest_checkpoint,
     load_checkpoint,
+    prune_checkpoints,
     restore_checkpoint,
     save_checkpoint,
     save_model,
@@ -67,6 +68,44 @@ def test_latest_checkpoint_filters_by_training_mode(tmp_path: Path):
 
     assert latest_checkpoint(tmp_path, "pretrain").name == "pretrain-step-00000010.pt"
     assert latest_checkpoint(tmp_path, "sft").name == "sft-step-00000099.pt"
+
+
+def test_prune_checkpoints_preserves_best_and_milestones(tmp_path: Path):
+    model, optimizer = make_model_and_optimizer()
+    config = model_config_from_preset("tiny", 32, 8).to_dict()
+    for step in (1, 2, 3):
+        save_checkpoint(
+            tmp_path,
+            model,
+            optimizer,
+            step=step,
+            blocks_consumed=step,
+            mode="pretrain",
+            model_config=config,
+            run_config={},
+        )
+    for filename in ("best.pt", "pretrain-milestone-00000002.pt"):
+        save_checkpoint(
+            tmp_path,
+            model,
+            optimizer,
+            step=2,
+            blocks_consumed=2,
+            mode="pretrain",
+            model_config=config,
+            run_config={},
+            filename=filename,
+        )
+
+    removed = prune_checkpoints(tmp_path, "pretrain", keep_last=1)
+
+    assert [path.name for path in removed] == [
+        "pretrain-step-00000001.pt",
+        "pretrain-step-00000002.pt",
+    ]
+    assert (tmp_path / "pretrain-step-00000003.pt").exists()
+    assert (tmp_path / "best.pt").exists()
+    assert (tmp_path / "pretrain-milestone-00000002.pt").exists()
 
 
 def test_save_model_writes_inference_artifact_without_optimizer(tmp_path: Path):

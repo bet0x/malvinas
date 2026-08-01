@@ -15,6 +15,9 @@ dependencies = [
 
 [project.scripts]
 malvinas-train = "malvinas.cli:main"
+malvinas-benchmark-moe = "malvinas.benchmark_moe:main"
+malvinas-generate = "malvinas.generate:main"
+malvinas-evaluate = "malvinas.evaluate:main"
 
 [dependency-groups]
 dev = [
@@ -24,6 +27,10 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: requires access to external datasets or services",
+]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }

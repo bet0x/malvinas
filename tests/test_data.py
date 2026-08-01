@@ -1,9 +1,13 @@
 import json
 
+import pytest
 import torch
 
+import malvinas.data as data
 from malvinas.data import (
     dolma_quality_score,
+    pack_document_tokens,
+    pack_sft_document_tokens,
     pack_sft_tokens,
     pack_tokens,
     stream_pretrain_documents,
@@ -61,6 +65,39 @@ def test_pack_tokens_yields_before_consuming_the_document_stream():
     assert torch.equal(y, torch.tensor([2, 3, 4]))
 
 
+def test_document_packing_resets_positions_and_masks_cross_document_target():
+    blocks = list(
+        pack_document_tokens(
+            [[10, 11], [20, 21, 22]],
+            block_size=4,
+            separator_id=999,
+        )
+    )
+
+    block = blocks[0]
+    assert torch.equal(block.input_ids, torch.tensor([10, 11, 999, 20]))
+    assert torch.equal(block.target_ids, torch.tensor([11, 999, 20, 21]))
+    assert torch.equal(block.position_ids, torch.tensor([0, 1, 2, 0]))
+    assert torch.equal(block.document_ids, torch.tensor([0, 0, 0, 1]))
+    assert torch.equal(block.loss_mask, torch.tensor([True, True, False, True]))
+
+
+def test_sft_document_packing_combines_assistant_and_boundary_masks():
+    blocks = list(
+        pack_sft_document_tokens(
+            [([10, 11], [False, True]), ([20, 21], [False, True])],
+            block_size=3,
+            separator_id=999,
+        )
+    )
+
+    first = blocks[0]
+    assert torch.equal(first.input_ids, torch.tensor([10, 11, 999]))
+    assert torch.equal(first.target_ids, torch.tensor([11, 999, 20]))
+    assert torch.equal(first.loss_mask, torch.tensor([True, False, False]))
+    assert torch.equal(first.position_ids, torch.tensor([0, 1, 2]))
+
+
 def test_pack_sft_tokens_aligns_targets_and_masks_separator():
     examples = [([10, 11, 12], [False, True, True]), ([20, 21], [False, True])]
 
@@ -98,6 +135,22 @@ def test_dolma_quality_score_handles_missing_field_as_zero():
     assert dolma_quality_score(metadata) == 0.0
 
 
+def test_pretrain_stream_passes_optional_dataset_config(monkeypatch):
+    calls = []
+
+    def fake_load_dataset(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [{"text": "ok", "metadata": '{"dolma2_qc":{"1":1.0}}'}]
+
+    monkeypatch.setattr(data, "load_dataset", fake_load_dataset)
+
+    assert list(stream_pretrain_documents("repo", config_name="subset")) == ["ok"]
+    assert calls == [
+        (("repo", "subset"), {"split": "train", "streaming": True})
+    ]
+
+
+@pytest.mark.integration
 def test_stream_pretrain_documents_actually_applies_the_quality_filter():
     """Integration test against the real Dolma 3 Mix stream (network):
     a strict threshold must not admit more documents than a permissive one

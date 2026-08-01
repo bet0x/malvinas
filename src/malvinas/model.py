@@ -24,9 +24,12 @@ class MalvinasModel(nn.Module):
         global_rope_theta: float | None = None,
         global_rotary_pct: float = 1.0,
         mtp_depth: int | None = None,
+        moe_kernel: str = "auto",
+        document_attention_backend: str = "auto",
     ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.max_seq_len = max_seq_len
 
         # every (local_global_ratio + 1)-th layer is global (Gemma 4's 5:1 split);
         # if no ratio is given, every layer is "local" with full RoPE, no windowing.
@@ -44,6 +47,8 @@ class MalvinasModel(nn.Module):
                     expert_dim,
                     window_size=None if is_global else local_window_size,
                     reuse_key_as_value=is_global,
+                    moe_kernel=moe_kernel,
+                    document_attention_backend=document_attention_backend,
                 )
                 for is_global in self.is_global_layer
             ]
@@ -65,7 +70,10 @@ class MalvinasModel(nn.Module):
             assert mtp_depth == 1, "only mtp_depth=1 is implemented"
             self.mtp_head = MTPHead(
                 d_model, n_heads, num_experts, top_k, expert_dim,
-                self.token_embedding, self.output_head,
+                self.token_embedding,
+                self.output_head,
+                moe_kernel,
+                document_attention_backend,
             )
 
     def resize_token_embeddings(self, new_vocab_size: int) -> None:
@@ -99,28 +107,82 @@ class MalvinasModel(nn.Module):
             self.mtp_head.token_embedding = self.token_embedding
             self.mtp_head.output_head = self.output_head
 
-    def _trunk_forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def _trunk_forward(
+        self,
+        token_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        document_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Runs every transformer block, returns the hidden state *before*
         final_norm/output_head -- shared by forward() and forward_with_mtp()."""
         T = token_ids.shape[1]
         x = self.token_embedding(token_ids)
         for block, is_global in zip(self.blocks, self.is_global_layer):
             freqs_cis = self.freqs_cis_global if is_global else self.freqs_cis_local
-            x = block(x, freqs_cis[:T])
+            block_freqs = freqs_cis[:T] if position_ids is None else freqs_cis[position_ids]
+            x = block(x, block_freqs, document_ids=document_ids)
         return x
 
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        x = self._trunk_forward(token_ids)
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        document_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = self._trunk_forward(token_ids, position_ids, document_ids)
         return self.output_head(self.final_norm(x))
 
+    def forward_cached(
+        self,
+        token_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Forward only new tokens and return one KV cache per layer."""
+        if token_ids.ndim != 2 or position_ids.shape != token_ids.shape:
+            raise ValueError("token_ids and position_ids must have the same [batch, time] shape")
+        if position_ids.numel() and int(position_ids.max()) >= self.max_seq_len:
+            raise ValueError("position exceeds the model's maximum sequence length")
+        if kv_cache is not None and len(kv_cache) != len(self.blocks):
+            raise ValueError("KV cache must contain one entry per transformer layer")
+
+        x = self.token_embedding(token_ids)
+        next_cache = []
+        for index, (block, is_global) in enumerate(
+            zip(self.blocks, self.is_global_layer)
+        ):
+            all_freqs = self.freqs_cis_global if is_global else self.freqs_cis_local
+            layer_cache = None if kv_cache is None else kv_cache[index]
+            x, layer_cache = block.forward_cached(
+                x,
+                all_freqs[position_ids],
+                layer_cache,
+            )
+            next_cache.append(layer_cache)
+        return self.output_head(self.final_norm(x)), next_cache
+
     def forward_with_mtp(
-        self, token_ids: torch.Tensor, next_token_ids: torch.Tensor
+        self,
+        token_ids: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        document_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Plan 09: main next-token logits, plus the MTP head's t+2
         prediction from the same trunk hidden state + the known t+1 tokens."""
         assert self.mtp_head is not None, "model was built without mtp_depth"
         T = token_ids.shape[1]
-        hidden = self._trunk_forward(token_ids)
+        hidden = self._trunk_forward(token_ids, position_ids, document_ids)
         logits = self.output_head(self.final_norm(hidden))
-        mtp_logits = self.mtp_head(hidden, next_token_ids, self.freqs_cis_local[:T])
+        freqs_cis = (
+            self.freqs_cis_local[:T]
+            if position_ids is None
+            else self.freqs_cis_local[position_ids]
+        )
+        mtp_logits = self.mtp_head(
+            hidden,
+            next_token_ids,
+            freqs_cis,
+            document_ids=document_ids,
+        )
         return logits, mtp_logits

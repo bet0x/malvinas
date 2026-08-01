@@ -1,6 +1,25 @@
 import torch
+import pytest
 
 from malvinas.moe import MoEFeedForward
+
+
+def test_rejects_unknown_kernel():
+    with pytest.raises(ValueError, match="kernel must be one of"):
+        MoEFeedForward(8, num_experts=4, top_k=2, expert_dim=16, kernel="unknown")
+
+
+def test_grouped_kernel_reports_that_cuda_is_required_on_cpu():
+    moe = MoEFeedForward(
+        8,
+        num_experts=4,
+        top_k=2,
+        expert_dim=16,
+        kernel="grouped_mm",
+    )
+
+    with pytest.raises(RuntimeError, match="CUDA"):
+        moe(torch.randn(1, 2, 8))
 
 
 def test_output_shape_matches_input():

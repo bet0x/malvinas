@@ -19,6 +19,8 @@ class ModelConfig:
     global_rope_theta: float | None = None
     global_rotary_pct: float = 1.0
     mtp_depth: int | None = None
+    moe_kernel: str = "auto"
+    document_attention_backend: str = "auto"
 
     def to_dict(self) -> dict:
         return asdict(self)

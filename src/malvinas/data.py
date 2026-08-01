@@ -1,8 +1,127 @@
 import json
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 
 import torch
 from datasets import load_dataset
+
+
+@dataclass(frozen=True)
+class PackedBlock:
+    input_ids: torch.Tensor
+    target_ids: torch.Tensor
+    loss_mask: torch.Tensor
+    position_ids: torch.Tensor
+    document_ids: torch.Tensor
+
+
+def _block_position_ids(
+    positions: list[int], document_ids: list[int]
+) -> torch.Tensor:
+    """Reset positions for each document segment visible in this block."""
+    offsets: dict[int, int] = {}
+    normalized = [
+        position - offsets.setdefault(document_id, position)
+        for position, document_id in zip(positions, document_ids)
+    ]
+    return torch.tensor(normalized, dtype=torch.long)
+
+
+def pack_document_tokens(
+    documents: Iterable[list[int]],
+    block_size: int,
+    separator_id: int,
+) -> Iterator[PackedBlock]:
+    """Pack documents without allowing attention or loss across boundaries."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+
+    token_buffer: list[int] = []
+    position_buffer: list[int] = []
+    document_buffer: list[int] = []
+    for document_id, document in enumerate(documents):
+        tokens = [*document, separator_id]
+        token_buffer.extend(tokens)
+        position_buffer.extend(range(len(tokens)))
+        document_buffer.extend([document_id] * len(tokens))
+
+        consumed = 0
+        while len(token_buffer) - consumed >= block_size + 1:
+            stop = consumed + block_size + 1
+            tokens_tensor = torch.tensor(token_buffer[consumed:stop], dtype=torch.long)
+            documents_tensor = torch.tensor(
+                document_buffer[consumed:stop],
+                dtype=torch.long,
+            )
+            same_document = documents_tensor[:-1] == documents_tensor[1:]
+            yield PackedBlock(
+                input_ids=tokens_tensor[:-1],
+                target_ids=tokens_tensor[1:],
+                loss_mask=same_document,
+                position_ids=_block_position_ids(
+                    position_buffer[consumed : stop - 1],
+                    document_buffer[consumed : stop - 1],
+                ),
+                document_ids=documents_tensor[:-1],
+            )
+            consumed += block_size
+        if consumed:
+            del token_buffer[:consumed]
+            del position_buffer[:consumed]
+            del document_buffer[:consumed]
+
+
+def pack_sft_document_tokens(
+    examples: Iterable[tuple[list[int], list[bool]]],
+    block_size: int,
+    separator_id: int,
+) -> Iterator[PackedBlock]:
+    """Pack SFT examples with assistant-only loss and isolated attention."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+
+    token_buffer: list[int] = []
+    mask_buffer: list[bool] = []
+    position_buffer: list[int] = []
+    document_buffer: list[int] = []
+    for document_id, (input_ids, loss_mask) in enumerate(examples):
+        if len(input_ids) != len(loss_mask):
+            raise ValueError("input_ids and loss_mask must have the same length")
+        tokens = [*input_ids, separator_id]
+        token_buffer.extend(tokens)
+        mask_buffer.extend([*loss_mask, False])
+        position_buffer.extend(range(len(tokens)))
+        document_buffer.extend([document_id] * len(tokens))
+
+        consumed = 0
+        while len(token_buffer) - consumed >= block_size + 1:
+            stop = consumed + block_size + 1
+            tokens_tensor = torch.tensor(token_buffer[consumed:stop], dtype=torch.long)
+            documents_tensor = torch.tensor(
+                document_buffer[consumed:stop],
+                dtype=torch.long,
+            )
+            target_mask = torch.tensor(
+                mask_buffer[consumed + 1 : stop],
+                dtype=torch.bool,
+            )
+            target_mask &= documents_tensor[:-1] == documents_tensor[1:]
+            yield PackedBlock(
+                input_ids=tokens_tensor[:-1],
+                target_ids=tokens_tensor[1:],
+                loss_mask=target_mask,
+                position_ids=_block_position_ids(
+                    position_buffer[consumed : stop - 1],
+                    document_buffer[consumed : stop - 1],
+                ),
+                document_ids=documents_tensor[:-1],
+            )
+            consumed += block_size
+        if consumed:
+            del token_buffer[:consumed]
+            del mask_buffer[:consumed]
+            del position_buffer[:consumed]
+            del document_buffer[:consumed]
 
 
 def pack_tokens(
@@ -78,11 +197,18 @@ def dolma_quality_score(metadata_json: str) -> float:
 
 
 def stream_pretrain_documents(
-    repo_id: str, min_quality_score: float = 0.5, max_documents: int | None = None
+    repo_id: str,
+    min_quality_score: float = 0.5,
+    max_documents: int | None = None,
+    split: str = "train",
+    config_name: str | None = None,
 ) -> Iterator[str]:
     """Stream `text` from a Dolma-3-Mix-shaped HF dataset, keeping only rows
     whose dolma2_qc score clears `min_quality_score`."""
-    ds = load_dataset(repo_id, split="train", streaming=True)
+    if config_name is None:
+        ds = load_dataset(repo_id, split=split, streaming=True)
+    else:
+        ds = load_dataset(repo_id, config_name, split=split, streaming=True)
     count = 0
     for row in ds:
         if max_documents is not None and count >= max_documents:
@@ -125,12 +251,13 @@ def stream_sft_examples(
     config_name: str | None = None,
     max_examples: int | None = None,
     row_to_messages=lambda row: row["messages"],
+    split: str = "train",
 ) -> Iterator[tuple[list[int], list[bool]]]:
     """Stream a chat-shaped HF dataset and format each conversation via
     build_sft_example (plan 00 §7). Defaults to the {messages: [...]} shape
     (SmolTalk, Dolci-Think-SFT); pass `row_to_messages` (e.g.
     xlam_to_messages) to adapt a differently-shaped dataset first."""
-    ds = load_dataset(repo_id, config_name, split="train", streaming=True)
+    ds = load_dataset(repo_id, config_name, split=split, streaming=True)
     for i, row in enumerate(ds):
         if max_examples is not None and i >= max_examples:
             break
