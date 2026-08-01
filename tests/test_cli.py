@@ -22,6 +22,8 @@ def test_cli_exposes_pretrain_sft_presets_and_checkpoint_options():
     assert args.mode == "sft"
     assert args.preset == "0.5b"
     assert str(args.init_from) == "pretrain.pt"
+    assert args.models_dir.name == "models"
+    assert args.checkpoint_dir is None
 
 
 def test_cli_rejects_resume_and_init_from_together():
@@ -31,6 +33,20 @@ def test_cli_rejects_resume_and_init_from_together():
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         _validate_args(args)
+
+
+def test_cli_rejects_model_name_with_path_components():
+    args = build_parser().parse_args(
+        ["--mode", "pretrain", "--model-name", "../outside"]
+    )
+
+    with pytest.raises(ValueError, match="--model-name"):
+        _validate_args(args)
+
+
+def test_sft_name_does_not_repeat_stage_suffix():
+    assert cli._stage_model_name("malvinas-tiny", "sft") == "malvinas-tiny-sft"
+    assert cli._stage_model_name("malvinas-tiny-sft", "sft") == "malvinas-tiny-sft"
 
 
 def test_next_batch_stacks_sft_masks():
@@ -81,14 +97,16 @@ def test_training_can_resume_and_initialize_a_new_stage(tmp_path, monkeypatch):
             "4",
             "--max-steps",
             "2",
-            "--checkpoint-dir",
-            str(tmp_path / "pretrain"),
+            "--models-dir",
+            str(tmp_path / "models"),
             "--save-every",
             "2",
         ]
     )
     pretrain_path = cli.run_training(pretrain)
     assert load_checkpoint(pretrain_path)["step"] == 2
+    assert pretrain_path.parent == tmp_path / "models" / "malvinas-tiny" / "checkpoints"
+    assert (tmp_path / "models" / "malvinas-tiny" / "model.pt").exists()
 
     resumed = parser.parse_args(
         [
@@ -98,8 +116,8 @@ def test_training_can_resume_and_initialize_a_new_stage(tmp_path, monkeypatch):
             "4",
             "--max-steps",
             "3",
-            "--checkpoint-dir",
-            str(tmp_path / "pretrain"),
+            "--models-dir",
+            str(tmp_path / "models"),
             "--resume",
             "latest",
         ]
@@ -117,8 +135,8 @@ def test_training_can_resume_and_initialize_a_new_stage(tmp_path, monkeypatch):
             "4",
             "--max-steps",
             "1",
-            "--checkpoint-dir",
-            str(tmp_path / "sft"),
+            "--models-dir",
+            str(tmp_path / "models"),
             "--init-from",
             str(resumed_path),
         ]
@@ -127,3 +145,5 @@ def test_training_can_resume_and_initialize_a_new_stage(tmp_path, monkeypatch):
     sft_payload = load_checkpoint(sft_path)
     assert sft_payload["mode"] == "sft"
     assert sft_payload["step"] == 1
+    assert sft_path.parent == tmp_path / "models" / "malvinas-tiny-sft" / "checkpoints"
+    assert (tmp_path / "models" / "malvinas-tiny-sft" / "model.pt").exists()

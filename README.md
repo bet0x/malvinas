@@ -48,6 +48,7 @@ Start a small pretraining run:
 uv run malvinas-train \
   --mode pretrain \
   --preset tiny \
+  --model-name malvinas-tiny \
   --max-examples 1000 \
   --max-steps 100 \
   --save-every 25
@@ -69,9 +70,28 @@ fresh optimizer and step counter:
 ```bash
 uv run malvinas-train \
   --mode sft \
-  --init-from checkpoints/pretrain-step-00000200.pt \
+  --init-from models/malvinas-tiny/checkpoints/pretrain-step-00000200.pt \
   --max-steps 100
 ```
+
+By default, training outputs are grouped by model and stage:
+
+```text
+models/
+  malvinas-tiny/
+    model.pt
+    checkpoints/
+      pretrain-step-00000100.pt
+  malvinas-tiny-sft/
+    model.pt
+    checkpoints/
+      sft-step-00000100.pt
+```
+
+`model.pt` contains the final weights and model metadata for inference. Each
+checkpoint also includes optimizer, progress, and random state so training can
+resume exactly. Use `--model-name` to choose the directory name, `--models-dir`
+to change the `models/` root, or `--checkpoint-dir` as an explicit override.
 
 Use `--preset 0.5b`, `--preset 1b-deep`, or `--preset 1b-wide` for the
 larger target configurations. Those presets require appropriate GPU memory;

@@ -2,7 +2,13 @@ from pathlib import Path
 
 import torch
 
-from malvinas.checkpoint import latest_checkpoint, load_checkpoint, restore_checkpoint, save_checkpoint
+from malvinas.checkpoint import (
+    latest_checkpoint,
+    load_checkpoint,
+    restore_checkpoint,
+    save_checkpoint,
+    save_model,
+)
 from malvinas.config import model_config_from_preset
 
 
@@ -60,3 +66,24 @@ def test_latest_checkpoint_filters_by_training_mode(tmp_path: Path):
 
     assert latest_checkpoint(tmp_path, "pretrain").name == "pretrain-step-00000010.pt"
     assert latest_checkpoint(tmp_path, "sft").name == "sft-step-00000099.pt"
+
+
+def test_save_model_writes_inference_artifact_without_optimizer(tmp_path: Path):
+    model, _ = make_model_and_optimizer()
+    config = model_config_from_preset("tiny", 32, 8).to_dict()
+
+    path = save_model(
+        tmp_path / "malvinas-tiny",
+        model,
+        step=12,
+        mode="pretrain",
+        model_name="malvinas-tiny",
+        model_config=config,
+        run_config={"model_name": "malvinas-tiny"},
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+
+    assert path == tmp_path / "malvinas-tiny" / "model.pt"
+    assert payload["model_name"] == "malvinas-tiny"
+    assert "model_state_dict" in payload
+    assert "optimizer_state_dict" not in payload

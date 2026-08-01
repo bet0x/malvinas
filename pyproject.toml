@@ -23,6 +23,7 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+testpaths = ["tests"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }

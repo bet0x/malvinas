@@ -1,4 +1,5 @@
 import argparse
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from malvinas.checkpoint import (
     load_checkpoint,
     restore_checkpoint,
     save_checkpoint,
+    save_model,
 )
 from malvinas.config import PRESET_NAMES, ModelConfig, model_config_from_preset
 from malvinas.data import (
@@ -45,7 +47,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
+    parser.add_argument(
+        "--model-name",
+        help="Output model name (default: malvinas-{preset}, with -sft for SFT).",
+    )
+    parser.add_argument("--models-dir", type=Path, default=Path("models"))
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        help="Override the default models/{model_name}/checkpoints directory.",
+    )
     parser.add_argument(
         "--resume",
         help="Resume a run checkpoint, or use 'latest' for the newest checkpoint of this mode.",
@@ -71,6 +82,29 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.learning_rate <= 0:
         raise ValueError("--learning-rate must be positive")
+    if args.model_name and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.model_name):
+        raise ValueError(
+            "--model-name must start with a letter or digit and contain only "
+            "letters, digits, dots, underscores, or hyphens"
+        )
+
+
+def _default_model_name(args: argparse.Namespace) -> str:
+    suffix = "-sft" if args.mode == "sft" else ""
+    return f"malvinas-{args.preset}{suffix}"
+
+
+def _stage_model_name(source_model_name: str, mode: str) -> str:
+    suffix = f"-{mode}"
+    if source_model_name.endswith(suffix):
+        return source_model_name
+    return f"{source_model_name}{suffix}"
+
+
+def _output_paths(args: argparse.Namespace, model_name: str) -> tuple[Path, Path]:
+    model_dir = args.models_dir / model_name
+    checkpoint_dir = args.checkpoint_dir or model_dir / "checkpoints"
+    return model_dir, checkpoint_dir
 
 
 def _resolve_device(value: str) -> torch.device:
@@ -102,7 +136,9 @@ def _infer_separator_id(tokenizer: Tokenizer) -> int:
     raise ValueError("tokenizer has no known end-of-text token; pass --separator-id")
 
 
-def _new_run_config(args: argparse.Namespace, tokenizer: Tokenizer) -> dict:
+def _new_run_config(
+    args: argparse.Namespace, tokenizer: Tokenizer, model_name: str
+) -> dict:
     dataset = args.dataset
     dataset_config = args.dataset_config
     if args.mode == "pretrain":
@@ -113,6 +149,7 @@ def _new_run_config(args: argparse.Namespace, tokenizer: Tokenizer) -> dict:
             dataset_config = "all"
 
     return {
+        "model_name": model_name,
         "mode": args.mode,
         "dataset": dataset,
         "dataset_config": dataset_config,
@@ -193,10 +230,12 @@ def run_training(args: argparse.Namespace) -> Path:
     autocast_dtype = _resolve_autocast_dtype(args.precision, device)
     torch.manual_seed(args.seed)
 
+    model_name = args.model_name or _default_model_name(args)
+    _, checkpoint_dir = _output_paths(args, model_name)
     resume_payload = None
     if args.resume:
         resume_path = (
-            latest_checkpoint(args.checkpoint_dir, args.mode)
+            latest_checkpoint(checkpoint_dir, args.mode)
             if args.resume == "latest"
             else Path(args.resume)
         )
@@ -208,15 +247,33 @@ def run_training(args: argparse.Namespace) -> Path:
 
     init_payload = load_checkpoint(args.init_from) if args.init_from else None
     source_payload = resume_payload or init_payload
+    source_model_name = (
+        source_payload["run_config"].get("model_name") if source_payload else None
+    )
+    if (
+        args.model_name
+        and resume_payload
+        and source_model_name
+        and args.model_name != source_model_name
+    ):
+        raise ValueError(
+            f"--model-name must remain {source_model_name!r} when resuming this run"
+        )
+    if not args.model_name and resume_payload and source_model_name:
+        model_name = source_model_name
+    elif not args.model_name and init_payload and source_model_name:
+        model_name = _stage_model_name(source_model_name, args.mode)
+    model_dir, checkpoint_dir = _output_paths(args, model_name)
     tokenizer_repo = (
         resume_payload["run_config"]["tokenizer"] if resume_payload else args.tokenizer
     )
     tokenizer = Tokenizer(tokenizer_repo)
 
     if resume_payload:
-        run_config = resume_payload["run_config"]
+        run_config = dict(resume_payload["run_config"])
+        run_config.setdefault("model_name", model_name)
     else:
-        run_config = _new_run_config(args, tokenizer)
+        run_config = _new_run_config(args, tokenizer, model_name)
 
     if source_payload:
         model_config = ModelConfig.from_dict(source_payload["model_config"])
@@ -271,7 +328,7 @@ def run_training(args: argparse.Namespace) -> Path:
             print(f"step={step} loss={loss:.6f} blocks={blocks_consumed}", flush=True)
         if step % args.save_every == 0:
             last_checkpoint = save_checkpoint(
-                args.checkpoint_dir,
+                checkpoint_dir,
                 model,
                 optimizer,
                 step=step,
@@ -287,7 +344,7 @@ def run_training(args: argparse.Namespace) -> Path:
         raise RuntimeError("dataset produced no complete training blocks")
     if step != last_saved_step:
         last_checkpoint = save_checkpoint(
-            args.checkpoint_dir,
+            checkpoint_dir,
             model,
             optimizer,
             step=step,
@@ -297,6 +354,16 @@ def run_training(args: argparse.Namespace) -> Path:
             run_config=run_config,
         )
         print(f"checkpoint={last_checkpoint}", flush=True)
+    model_path = save_model(
+        model_dir,
+        model,
+        step=step,
+        mode=args.mode,
+        model_name=model_name,
+        model_config=model_config.to_dict(),
+        run_config=run_config,
+    )
+    print(f"model={model_path}", flush=True)
     return last_checkpoint
 
 

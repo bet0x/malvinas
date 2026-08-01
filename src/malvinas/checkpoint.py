@@ -5,10 +5,19 @@ import torch
 from torch import nn
 
 CHECKPOINT_VERSION = 1
+MODEL_VERSION = 1
 
 
 def checkpoint_filename(mode: str, step: int) -> str:
     return f"{mode}-step-{step:08d}.pt"
+
+
+def _atomic_save(payload: dict, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, destination)
+    return destination
 
 
 def save_checkpoint(
@@ -23,10 +32,7 @@ def save_checkpoint(
     run_config: dict,
 ) -> Path:
     """Atomically save everything required to resume a training run."""
-    directory = Path(checkpoint_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    destination = directory / checkpoint_filename(mode, step)
-    temporary = destination.with_suffix(".pt.tmp")
+    destination = Path(checkpoint_dir) / checkpoint_filename(mode, step)
     payload = {
         "version": CHECKPOINT_VERSION,
         "step": step,
@@ -40,9 +46,30 @@ def save_checkpoint(
     }
     if torch.cuda.is_available():
         payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
-    torch.save(payload, temporary)
-    os.replace(temporary, destination)
-    return destination
+    return _atomic_save(payload, destination)
+
+
+def save_model(
+    model_dir: str | Path,
+    model: nn.Module,
+    *,
+    step: int,
+    mode: str,
+    model_name: str,
+    model_config: dict,
+    run_config: dict,
+) -> Path:
+    """Save the final inference artifact without optimizer or RNG state."""
+    payload = {
+        "version": MODEL_VERSION,
+        "model_name": model_name,
+        "step": step,
+        "mode": mode,
+        "model_config": model_config,
+        "run_config": run_config,
+        "model_state_dict": model.state_dict(),
+    }
+    return _atomic_save(payload, Path(model_dir) / "model.pt")
 
 
 def load_checkpoint(path: str | Path) -> dict:
